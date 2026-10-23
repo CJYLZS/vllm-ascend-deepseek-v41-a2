@@ -59,24 +59,59 @@ ModelScope：**[chiro2001/DeepSeek-V4.1-Flash-1017-w4a8-Ascend](https://www.mode
 pip install modelscope
 modelscope download --model chiro2001/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
     --local_dir /path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
+
+cd /path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
+sha256sum --check SHA256SUMS
+cd engram_int8
+bash reassemble_engram_weights.sh
 ```
 
-下载体积约 **673 GB**，主要构成：
+> ⚠ **最后一步 `reassemble_engram_weights.sh` 不能省。** 仓库里两张 Engram 权重
+> （`layers_1_...` / `layers_14_...`，各约 98 GB）是以 **6 片分片**上传的
+> （`part-00-of-06` … `part-05-of-06`），运行时只认重组后的**单文件**
+> `.safetensors`，不会自动读 `.part-*`。跳过重组直接起服会报：
+>
+> ```
+> ValueError: Engram layer 1: the checkpoint index points at
+> .../engram_int8/layers_1_engram_embed.weight.safetensors, which does not exist.
+> ```
+>
+> 脚本会先校验分片清单连续性、逐片 SHA256，拼接后再校验完整表 SHA256，最后原子替换。
+> 需要为两张还原表额外预留约 **184 GiB** 磁盘；已还原且校验正确的文件会被直接复用，
+> 重复执行是安全的（幂等）。
+>
+> ```bash
+> bash reassemble_engram_weights.sh --check-only     # 只校验，报告是否需要重组
+> bash reassemble_engram_weights.sh --delete-parts  # 重组成功后删掉分片，省约 184 GiB
+> ```
+>
+> 删掉分片后根目录 `SHA256SUMS` 里对应条目会自然缺失，此时改用
+> `cd engram_int8 && sha256sum --check WEIGHTS.sha256` 校验完整表。
+
+主要构成：
 
 | 部分 | 大小 | 说明 |
 |---|---|---|
 | `quant_model_weights-*-of-00080.safetensors` | 292 GB | 80 个分片，w4a8 量化主权重 |
-| `engram_int8/` | 390 GB | engram embedding，按层分片（`.part-00-of-06` …） |
+| `engram_int8/*.part-00-of-06` … `part-05-of-06` | 196 GB | 两张 Engram 表的 6 片分片（需重组） |
+| `engram_int8/layers_{1,14}_engram_embed.weight.safetensors` | 196 GB | 重组后的完整表（脚本生成） |
 | `engram_extra.safetensors` | 0.6 GB | engram 附加权重 |
 | `mtpq-*-of-00004.safetensors` | 10 GB | MTP（dspark 投机解码）权重 |
 | `quant_model_description.json` | 11 MB | 量化描述，加载时读 |
 
-> **`engram_int8/` 不能省**。它是 engram 层的 int8 权重，占整个权重的 58%；
-> 删掉或只下一部分，加载阶段就会报缺文件。分片文件（`.part-NN-of-MM`）必须整组齐全。
+磁盘按三个阶段算：
 
-空间上按 **680 GB 以上**准备。权重目录只需**只读**挂载（脚本用 `:ro`），可以放在
-NFS / 共享存储上多机复用；但路径一旦确定就别改 —— 编译缓存的键含模型路径，
-换路径等于全量冷启动。
+| 阶段 | 占用 | 说明 |
+|---|---|---|
+| 刚下载完 | **约 500 GB** | 只有分片，无完整表 |
+| 重组后（分片保留） | **约 695 GB** | 分片与完整表并存，建议按此预留 |
+| 重组后 `--delete-parts` | 约 500 GB | 删分片回收 196 GB |
+
+> **`engram_int8/` 不能省**。它是 engram 层的 int8 权重，占整个权重的绝大部分；
+> 删掉或只下一部分，加载阶段就会报缺文件。分片文件必须整组齐全。
+
+权重目录只需**只读**挂载（脚本用 `:ro`），可以放在 NFS / 共享存储上多机复用；
+但路径一旦确定就别改 —— 编译缓存的键含模型路径，换路径等于全量冷启动。
 
 ---
 
