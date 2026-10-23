@@ -1,0 +1,105 @@
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 841de385cb61a435c09997e151083d655cce4e87..c20034ec6efdc51b17db923b5715c124a358957c 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -168,6 +168,73 @@ def sort_tool_results_by_call_order(
+ 
+ SYSTEM_SP_TOKEN = "<｜System｜>"
+ 
++# ---- control-token escaping ------------------------------------------------
++# A control token appearing verbatim in caller-supplied text encodes to a single
++# token, so literal text could forge a turn boundary: a user message containing
++# "<|Assistant|>\n..." makes the model believe it authored that line. Measured
++# on this host before the fix: encode_messages() emitted USER_SP twice for one
++# user message. Neutralising it inserts a zero-width space after the leading "<",
++# which splits the token while leaving the text readable.
++#
++# IMAGE_PLACEHOLDER is deliberately absent: it has its own rejection path and
++# must keep raising rather than being silently rewritten.
++_TURN_BOUNDARY_TOKENS: tuple = (
++    bos_token,
++    eos_token,
++    USER_SP_TOKEN,
++    ASSISTANT_SP_TOKEN,
++    SYSTEM_SP_TOKEN,
++    LATEST_REMINDER_SP_TOKEN,
++    *DS_TASK_SP_TOKENS.values(),
++)
++
++_ESCAPE_MARK = "\u200b"
++
++
++def escape_control_tokens(text: str) -> str:
++    """Neutralize control tokens embedded in free-form text."""
++    for token in _TURN_BOUNDARY_TOKENS:
++        if token in text:
++            text = text.replace(token, token[0] + _ESCAPE_MARK + token[1:])
++    return text
++
++
++def escape_message_control_tokens(msg: dict) -> None:
++    """Rewrite control tokens in any free-form field of ``msg`` (in place).
++
++    Only caller-supplied text is touched; the image placeholder this module
++    generates later is produced after this runs, so it is never escaped.
++    """
++    content = msg.get("content")
++    if isinstance(content, str):
++        msg["content"] = escape_control_tokens(content)
++
++    for key in ("reasoning", "reasoning_content"):
++        value = msg.get(key)
++        if isinstance(value, str):
++            msg[key] = escape_control_tokens(value)
++
++    for blk in msg.get("content_blocks") or []:
++        if not isinstance(blk, dict):
++            continue
++        if isinstance(blk.get("text"), str):
++            blk["text"] = escape_control_tokens(blk["text"])
++        if blk.get("type") == "tool_result":
++            inner = blk.get("content")
++            if isinstance(inner, str):
++                blk["content"] = escape_control_tokens(inner)
++            elif isinstance(inner, list):
++                for sub in inner:
++                    if isinstance(sub, dict) and isinstance(sub.get("text"), str):
++                        sub["text"] = escape_control_tokens(sub["text"])
++
++    for call in msg.get("tool_calls") or []:
++        function = (call or {}).get("function") or {}
++        arguments = function.get("arguments")
++        if isinstance(arguments, str):
++            function["arguments"] = escape_control_tokens(arguments)
++
++
+ tool_calls_block_name: str = " calls"
+ tool_call_tag_name: str = " invoke"
+ tool_parameter_tag_name: str = " parameter"
+@@ -363,10 +430,10 @@ def render_message(
+             )
+ 
+     elif role == "developer":
+-        assert content, f"Invalid message for role `{role}`: {msg}"
+-
+-        content_developer = USER_SP_TOKEN
+-        content_developer += content
++        # A developer message may legitimately carry no text -- e.g. a client that
++        # only uses it to attach tools. This used to be an assert, so such a
++        # request became HTTP 500. Render an empty developer block instead.
++        content_developer = USER_SP_TOKEN + (content if isinstance(content, str) else "")
+ 
+         if tools:
+             content_developer += "\n\n" + render_tools(tools)
+@@ -550,6 +617,11 @@ def encode_messages(
+ 
+     full_messages = context + messages
+ 
++    # Neutralize caller-supplied control tokens before any rendering, so a
++    # literal "<|Assistant|>" in user text cannot forge a turn boundary.
++    for _msg in full_messages:
++        escape_message_control_tokens(_msg)
++
+     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
+ 
+     # Resolve drop_thinking: if any message has tools defined, don't drop thinking

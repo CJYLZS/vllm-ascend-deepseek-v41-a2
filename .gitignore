@@ -1,0 +1,8 @@
+# 起服脚本的运行期产物（start-server.sh 生成）
+/tree/
+/runtime/
+
+# 通用
+*.log
+__pycache__/
+.DS_Store
