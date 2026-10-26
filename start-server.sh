@@ -210,11 +210,16 @@ echo "$PID" > "$LOG_DIR/server.pid"
 
 # ---- WAIT=1：等 READY，并硬校验 4 件"静默失效"的东西 ----------------------
 if [ "${WAIT:-0}" = "1" ]; then
-  T=0
+  # 宽限期不能省：上面是 nohup 后台 docker run 并立即返回，此时容器还没创建出来，
+  # `docker ps` 查不到 —— 直接判"已退出"会把正常启动误报成失败（实测踩过）。
+  T=0; GRACE=120; st=""
   while :; do
-    if ! docker ps --filter "name=^${NAME}$" --format '{{.Status}}' | grep -q '^Up'; then
-      echo "[start] FATAL: 容器已退出，看日志 $LOG" >&2; exit 3
+    st="$(docker ps -a --filter "name=^${NAME}$" --format '{{.Status}}' | head -1)"
+    if [ -z "$st" ]; then
+      (( T < GRACE )) || { echo "[start] FATAL: ${GRACE}s 内未见容器 $NAME，看 $LOG" >&2; exit 3; }
+      sleep 5; T=$((T+5)); continue
     fi
+    echo "$st" | grep -q '^Up' || { echo "[start] FATAL: 容器已退出（$st），看日志 $LOG" >&2; exit 3; }
     grep -q 'Application startup complete' "$LOG" 2>/dev/null && break
     (( T >= ${READY_TIMEOUT:-2700} )) && { echo "[start] FATAL: 超时未 READY" >&2; exit 1; }
     sleep 10; T=$((T+10))
@@ -226,7 +231,7 @@ if [ "${WAIT:-0}" = "1" ]; then
   # 那两条只在 V1 的 proposer 里打印，V2 下恒为 0 —— 照抄 V1 会把成功判成失败。
   n_v2=$(grep -c 'npu model runner v2 is in developing' "$LOG" || true)
   n_v1mark=$(grep -c 'runtime_mode=FULL\|\[dspark-graph-capture\]' "$LOG" || true)
-  n_tgt=$(grep -oE 'Capturing CUDA graphs \(FULL\): 100%.*\| [0-9]+/[0-9]+' "$LOG" | grep -oE '[0-9]+/[0-9]+$' | cut -d/ -f1 | sort -u | tr '\n' ',' )
+  n_tgt=$(tr '\r' '\n' < "$LOG" | grep -oE 'Capturing CUDA graphs \(FULL\): +[0-9]+%[^|]*\| *[0-9]+/[0-9]+' | grep -oE '[0-9]+/[0-9]+$' | cut -d/ -f1 | sort -un | paste -sd, -)
   echo "[start] 校验：V2 worker 标记 ${n_v2}/${TP}，目标图 ${n_tgt:-<未找到>}"
   echo "[start]       V1-only 标记应为 0：${n_v1mark}"
   grep -oE 'NPU KV cache size: [0-9,]+ tokens' "$LOG" | tail -1 || true
