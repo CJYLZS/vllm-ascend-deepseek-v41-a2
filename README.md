@@ -2,11 +2,11 @@
 
 在 **8 × Ascend 910B3（A2）** 单机上服务
 [`DeepSeek-V4.1-Flash-1017-w4a8-Ascend`](https://www.modelscope.cn/models/chiro2001/DeepSeek-V4.1-Flash-1017-w4a8-Ascend)，
-基于官方 **vllm-ascend v0.30.0rc2**，叠加 5 个提交的调优改动。权重获取见 §1.1。
+基于官方 **vllm-ascend v0.30.0rc2**，默认启用 **Model Runner V2**。权重获取见 §1.1。
 
 | 文件 | 说明 |
 |---|---|
-| `vllm-ascend.patch` | vllm-ascend 侧，14 文件 +1244/−80 |
+| `vllm-ascend.patch` | vllm-ascend 侧，8 文件 +411/−64 |
 | `vllm.patch` | vllm 侧，1 文件 +76/−4 |
 | `start-server.sh` | 起服脚本（镜像 / 权重 / 端口全部由环境变量传入） |
 | `README.md` | 本文件 |
@@ -20,23 +20,27 @@
 
 单机 8 × 910B3（A2），TP8/EP8。协议：8K prompt → 512 输出，reps=3，temperature=0。
 
+### 与 V1 对比
+
+| 并发 | 1 | 4 | 5 | 8 | 9 | 13 |
+|---|---|---|---|---|---|---|
+| V1 每步 (ms) | 46.33 | 55.40 | 57.46 | 60.21 | 62.51 | 67.80 |
+| **V2 每步 (ms)** | **33.00** | **42.77** | **45.35** | **50.10** | **50.76** | **55.35** |
+| 每步降幅 | −28.8% | −22.8% | −21.1% | −16.8% | −18.8% | −18.4% |
+| V2 吞吐 (tok/s/流) | 120.0 | 70.6 | 58.1 | 56.3 | 51.5 | 48.7 |
+
+每步时延可复现到 0.3%，是最硬的判据。吞吐受投机解码接受长度抽签影响，
+单发波动 ±15%，只作参考。
+
 ### KV 容量
 
-**3,633,276 tokens**（同配置重起在 ±128 内浮动，`block_size=128` 取整）。
+**3,642,093 tokens**（V1 是 3,633,276，差 0.24%，在 `block_size=128` 取整的浮动范围内）。
 
-### 吞吐（每流 tok/s）
+### 口径说明
 
-| 并发 | 1 | 4 | 5 | 8 | 9 | 13 |
-|---|---|---|---|---|---|---|
-| tok/s | 74.6 | 55.2 | 47.0 | 42.3 | 42.6 | 41.2 |
-
-### 每步 decode 时延（ms）
-
-| 并发 | 1 | 4 | 5 | 8 | 9 | 13 |
-|---|---|---|---|---|---|---|
-| ms | 46.33 | 55.40 | 57.46 | 60.21 | 62.51 | 67.80 |
-
-吞吐受投机解码接受长度抽签影响，单发波动约 ±15%；时延可复现到 0.3%。
+V2 数据为本机实测；V1 一行为历史基准（同机同协议、不同次启动）。
+两组之间的差距**同时包含**「V2 runner」与「V2 用不上 6 个 dspark 开关」两个因素，
+不是纯 runner 对比。同一天同机背靠背测的 8K→256 那组给出 −20.3~−31.3%，量级一致。
 
 ---
 
@@ -126,7 +130,7 @@ FORCE=1 WAIT=1 bash start-server.sh     # 重启 + 等 READY + 自检
 DRY_RUN=1 bash start-server.sh          # 只打印 docker 命令，不起容器
 ```
 
-起服到 READY 约 **9~11 min**（256 条图捕获 × 8 卡），**首次**再加编译缓存冷启动。
+起服到 READY 约 **9~11 min**（目标模型 32 张图 × 8 卡），**首次**再加编译缓存冷启动。
 停服务 `docker stop dsv41`；健康检查：
 
 ```bash
@@ -219,39 +223,32 @@ PGO_SO=/path/to/libpython3.12.so.1.0 bash start-server.sh
 
 ---
 
-## 6. 静默失效：12 个开关必须都传
+## 6. 静默失效：6 个开关必须都传
 
-这是本包最容易踩的坑。下面 12 个 env **默认值全是 0**，不传时：
-
-- 服务**照常起、照常可用、日志不报错**
-- 收益**全部丢失**
+下面 6 个 env **默认值全是 0**，不传时服务照常起、日志不报错，但收益全丢。
 
 ```
-VLLM_ASCEND_DSPARK_DRAFT_GRAPH              draft 进 ACLGraph
-VLLM_ASCEND_DSPARK_GRAPH_CAPTURE_METADATA
-VLLM_ASCEND_DSPARK_CAPTURE_DISPATCH
-VLLM_ASCEND_DSPARK_CAPTURE_VALUE_FIX
-VLLM_ASCEND_DSPARK_CAPTURE_PAD_SLOTS
-VLLM_ASCEND_DSPARK_DISPATCH_QUERY_LEN_FIX   c≥7 时 SparseFlashMlaMetadata 尺寸校验不 FATAL
-VLLM_ASCEND_V41_TRITON_SLOT_MAPPING         单 launch Triton 槽位映射（每步 −2.2 ms）
-VLLM_ASCEND_ROPE_INDEX_SELECT               cos/sin 走 index_select（省 BroadcastTo+Cast）
-VLLM_ASCEND_V41_MOE_MASK_RANGE              连续 expert 区间比较（去 2× Cast/层）
-VLLM_ASCEND_V41_O_PROJ_2D                   wo_a 退化 batch matmul → 2D matmul
-VLLM_ASCEND_V41_QLI_NO_CANDIDATE            每层走 mode 3，关掉两级候选机制
-VLLM_ASCEND_V41_ENGRAM_WKV_TP               engram wkv 按输出维分片（每卡省 550 MB → 换 KV 容量）
+VLLM_ASCEND_V41_TRITON_SLOT_MAPPING     单 launch Triton 槽位映射
+VLLM_ASCEND_ROPE_INDEX_SELECT           cos/sin 走 index_select（省 BroadcastTo+Cast）
+VLLM_ASCEND_V41_MOE_MASK_RANGE          连续 expert 区间比较（去 2× Cast/层）
+VLLM_ASCEND_V41_O_PROJ_2D               wo_a 退化 batch matmul → 2D matmul
+VLLM_ASCEND_V41_QLI_NO_CANDIDATE        每层走 mode 3，关掉两级候选机制
+VLLM_ASCEND_V41_ENGRAM_WKV_TP           engram wkv 按输出维分片（每卡省 550 MB → 换 KV 容量）
 ```
 
 **全部在 import 期读取，且在捕获图里 ⇒ 只能重启切换，热改 env 无效。**
 
+V1 分支里有 12 个，本分支只留 6 个。另外 6 个 `VLLM_ASCEND_DSPARK_*` 只在
+`spec_decode/dspark_proposer.py` 和 `llm_base_proposer.py` 里被读，而这两个文件属于
+V1 的 proposer 路径。V2 走 `worker/v2/spec_decode/dspark/speculator.py`（继承上游
+`DSparkSpeculator` + `DFlashAclGraphManager`），根本不 import 它们。V1 里那 6 个开关
+换来的「draft 进 ACLGraph」，在 V2 由 `query_cudagraph_manager` 原生提供。
+传了不报错也不生效，所以本分支既不定义也不传。
+
 `start-server.sh` 因此做了两道防护：
 
-1. 起服前扫 `$SRC_DIR/vllm-ascend/vllm_ascend/envs.py`，确认每个 gate 都有定义，缺了直接
-   `exit 3` 并列出缺项 —— 不让你白等 9 分钟
-2. `WAIT=1` 时硬校验 draft **真的**进图（`runtime_mode=FULL` 应为 8 条、
-   `[dspark-graph-capture]` 应为 256 条），不对就 `exit 4`
-
-draft 桶数怎么算（容易算错）：**不是**桶表长度 × 8，而是桶表经 `ceil(s/(1+SPEC_TOKENS))`
-去重后的个数 × 8 卡。34 桶 → 32 → 256 条；去掉那 7 个 6N 补位（回到上游 27 桶）→ 25 → 200 条。
+1. 起服前扫源码树的 `envs.py`，确认每个 gate 都有定义，缺了直接 `exit 3` 列出缺项
+2. `WAIT=1` 时硬校验真的走了 V2，判据见 §7
 
 ---
 
@@ -265,13 +262,20 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/health   # 期望
 docker inspect dsv41 --format '{{json .Config.Cmd}}' | tr ',' '\n' | grep -E 'speculative|enable-prompt'
 docker inspect dsv41 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep VLLM_ASCEND
 
-# 3) prefix cache 观测可用（同一个 prompt 发两次，看 cached_tokens 应为 0 → 非 0）
+# 3) 确认真的走了 V2（V1 的判据在 V2 下恒为 0，不能拿来用）
+docker logs dsv41 2>&1 | grep -c 'npu model runner v2 is in developing'      # 期望 8
+docker logs dsv41 2>&1 | grep -c '\[dspark-graph-capture\]'                   # 期望 0
+#    目标图应在日志里看到 "Capturing CUDA graphs (FULL): 100%|...| 32/32"
+#    "ACL graph replay is active for the V2 target model" 要点：它在**首个请求之后**
+#    才打印（logger.info_once），起服完成时看不到是正常的
+
+# 4) prefix cache 观测可用（同一个 prompt 发两次，看 cached_tokens 应为 0 → 非 0）
 curl -s -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d "{\"model\":\"DeepSeek-V4.1-Flash\",\"messages\":[{\"role\":\"user\",\"content\":\"$(python3 -c "print('hello world '*200)")\"}],\"max_tokens\":8}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"])'
 ```
 
-第 3 步注意：短 prompt（<128 token）`cached_tokens` 恒为 0，这是 `block_size=128` 的
+第 4 步注意：短 prompt（<128 token）`cached_tokens` 恒为 0，这是 `block_size=128` 的
 取整粒度，**不是没生效**。
 
 ---
@@ -282,7 +286,7 @@ curl -s -X POST http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: appl
 |---|---|
 | `FATAL: 缺构建产物 ...vllm_ascend_C...so` | `SRC_DIR` 是空的 git 树，不是从镜像里取的。删掉 `SRC_DIR` 重跑 |
 | `FATAL: 这些 gate 传了 =1，但 envs.py 里没有定义` | 补丁没打成功，或 `SRC_DIR` 指向未打补丁的树。检查 `.patches-applied` |
-| 起服到了但明显慢，日志没报错 | 12 个开关少了几个。用 §7 第 2 步核对 |
+| 起服到了但明显慢，日志没报错 | 6 个开关少了几个。用 §7 第 2 步核对 |
 | `ImportError: libascend_hal.so` / `Failed to load the backend extension: torch_npu` | 在裸 `docker run` 里 import 了 vllm；必须带全部 `--device` 和驱动挂载 |
 | 起不来但没留下有用日志 | 脚本保留 log、plog、npulog，`docker stop` 后仍可查 `$LOG_DIR/logs/` |
 | KV 容量上报每次差 ±128 | 固定 HBM 下按 `block_size=128` 取整分配，不是参数变化 |
@@ -301,6 +305,12 @@ logs / plog / npulog / 编译缓存都落在 `$LOG_DIR`（默认 `./runtime/<hos
 - 补丁针对 `v0.30.0rc2` 原样应用。若你的镜像里 `/vllm-workspace` 的树被改过，
   `git apply` 会失败 —— 脚本立刻报错，不会静默。
 - 只验证过 8 卡 TP8/EP8 单机。改 `TP` 未测。
+- **Model Runner V2 在 vllm-ascend 侧标注为 `[Experimental]`**（见
+  `vllm_ascend/worker/v2/README.md`，仍列 5 条未补 gap）。官方 DeepSeek-V4 + dspark
+  的 e2e 用例覆盖的是 A3，A2 无官方覆盖 —— 本包的数据来自本机实测，不是持续的 CI 覆盖。
+- V2 的图捕获规模与 V1 不同：目标模型 **32 张**、draft **24 张**（V1 是 draft 32 桶 ×
+  8 卡 = 256 条）。draft 的 24 = 桶表按 `ceil(s/5)` 去重后，被
+  `max_num_seqs × num_query_per_req(5) = 160` 截掉超出部分的结果。
 - dspark 的 `num_speculative_tokens` 只能是 `n_predict=5` 的整数倍，`SPEC_TOKENS=10`
   实测更差（每步 +23.4%，接受 token 只 +20%）。
 - 跨会话比较 `A_spec` 会得出相反结论：每步成本能复现到 0.3%，`A_spec` 只能复现到 8~16%。
@@ -310,13 +320,25 @@ logs / plog / npulog / 编译缓存都落在 `$LOG_DIR`（默认 `./runtime/<hos
 
 ## 10. 改动概要
 
-本包在 rc2 之上叠了 5 个提交，按主题分：
+本分支相对 V1 分支只保留与 V2 共用的改动。补丁 8 文件 +411/−64，按主题分：
 
 | 主题 | 内容 |
 |---|---|
-| dspark draft 进图 | 修 `SparseFlashMlaMetadata` 尺寸校验导致的 c≥7 崩溃；5 个 `CAPTURE_*` 开关 |
 | 主机路径去重 | 配置常量按 builder 记忆化、标量哨兵换缓存张量（一个 `where(…, 标量)` 在 NPU 上等于 5 个 host 算子）、槽位链在 KV 组内复用 |
 | `where(out=)` | 原地写回，`copy_`/`empty_tensor` 各 −44 次/步 |
 | 槽位映射合 kernel | 21 条槽位链（每链 106 个 host 算子，只算 6 个 token）换成单 launch Triton 内核 |
-| 模型侧 | 6N 桶表；mask-range 区间比较；wo_a 2D；QLI 关候选；rope index_select；engram wkv TP 分片 |
-| prompt 编码 | 空 developer 消息、控制 token 注入两个缺陷 |
+| 模型侧 | mask-range 区间比较；wo_a 2D；QLI 关候选；rope index_select；engram wkv TP 分片 |
+| prompt 编码 | 空 developer 消息、控制 token 注入两个缺陷（在 `vllm.patch`） |
+
+**已从本分支移除**（属 V1 专属，V2 不经过这些代码）：
+
+| 移除项 | 原因 |
+|---|---|
+| `spec_decode/dspark_proposer.py` 全部改动 | V2 用 `worker/v2/spec_decode/dspark/speculator.py` |
+| `spec_decode/llm_base_proposer.py` 全部改动 | 同上 |
+| 6 个 `VLLM_ASCEND_DSPARK_*` 的 envs 定义 | 只有上面两个文件会读 |
+| 6N 桶表说明（`CUDAGRAPH_SIZES` 仍保留同表） | V2 的 graph 匹配允许大图服务小批，不依赖精确命中 6N |
+
+> V2 的 runner 能力全部来自镜像自带的 `worker/v2/`，**本补丁不修改 `worker/v2`
+> 任何一行**。但 V2 **并非零补丁**：§6 那 6 个 gate 在 pristine 镜像里都没有定义，
+> 全靠本补丁提供。

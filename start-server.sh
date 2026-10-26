@@ -44,14 +44,15 @@ IMAGE="$IMAGE"; export IMAGE MODEL
 # 缺 6N 时 ACL graph 补位会把 draft 打回 eager，实测每输出时延 +26%）。
 CUDAGRAPH_SIZES="${CUDAGRAPH_SIZES:-1,2,4,8,16,24,30,32,40,48,54,56,64,72,78,80,88,96,102,104,112,120,126,128,136,144,150,152,160,168,174,176,184,192}"
 
-# 12 个开关，**全部是"静默失效"型**：不传服务照常起，只是白丢收益，日志不报错。
+# 6 个开关，**全部是"静默失效"型**：不传服务照常起，只是白丢收益，日志不报错。
+#
+# 为什么是 6 个而不是 V1 分支的 12 个：另外 6 个 VLLM_ASCEND_DSPARK_* 只在
+# spec_decode/dspark_proposer.py 与 llm_base_proposer.py 里被读，而这两个文件
+# 属于 V1 的 proposer 路径。V2 走 worker/v2/spec_decode/dspark/speculator.py
+# （继承上游 DSparkSpeculator + DFlashAclGraphManager），根本不 import 它们。
+# V1 里那 6 个开关换来的「draft 进 ACLGraph」，在 V2 由 query_cudagraph_manager
+# 原生提供。传了不报错也不生效，所以本分支既不定义也不传。
 PASSTHRU_ENVS_STR="${PASSTHRU_ENVS_STR:-\
--e VLLM_ASCEND_DSPARK_DRAFT_GRAPH=1 \
--e VLLM_ASCEND_DSPARK_GRAPH_CAPTURE_METADATA=1 \
--e VLLM_ASCEND_DSPARK_CAPTURE_DISPATCH=1 \
--e VLLM_ASCEND_DSPARK_CAPTURE_VALUE_FIX=1 \
--e VLLM_ASCEND_DSPARK_CAPTURE_PAD_SLOTS=1 \
--e VLLM_ASCEND_DSPARK_DISPATCH_QUERY_LEN_FIX=1 \
 -e VLLM_ASCEND_V41_TRITON_SLOT_MAPPING=1 \
 -e VLLM_ASCEND_ROPE_INDEX_SELECT=1 \
 -e VLLM_ASCEND_V41_MOE_MASK_RANGE=1 \
@@ -145,7 +146,7 @@ RUN_ARGS=(
   -e ASCEND_RT_VISIBLE_DEVICES="${DEVICES_SPEC:-0,1,2,3,4,5,6,7}"
   -e PYTHONPYCACHEPREFIX=/workspace/run/pycache
   -e TRITON_ASCEND_ARCH="${TRITON_ARCH:-Ascend910B1}"
-  -e VLLM_USE_V2_MODEL_RUNNER=0
+  -e VLLM_USE_V2_MODEL_RUNNER=1
   -e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-3600}"
   -e TASK_QUEUE_ENABLE=1
   -e OMP_NUM_THREADS="${OMP_NUM_THREADS:-10}"
@@ -221,17 +222,19 @@ if [ "${WAIT:-0}" = "1" ]; then
   done
   echo "[start] READY after ${T}s"
 
-  n_full=$(grep -c 'runtime_mode=FULL' "$LOG" || true)
-  n_cap=$(grep -c '\[dspark-graph-capture\]' "$LOG" || true)
-  # draft 的桶数是**桶表经 ceil(s/(1+SPEC_TOKENS)) 去重**后的个数，不是桶表长度。
-  # 34 桶 -> draft 32 桶 -> 256 条（32 × 8 卡）。v24 的 27 桶 -> 25 -> 200 条。
-  n_buckets=$(tr ',' '\n' <<< "$CUDAGRAPH_SIZES" | awk -v k="$SPEC_TOKENS" 'NF{v=int(($1+k)/(1+k)); s[v]=1} END{print length(s)}')
-  n_expect=$(( n_buckets * TP ))
-  echo "[start] 校验：draft 进图 ${n_full}/${TP}，图捕获 ${n_cap} 条（期望 ${n_expect} = ${n_buckets} 桶 × ${TP} 卡）"
+  # V2 的判据与 V1 完全不同：V1 看 draft 进图（runtime_mode=FULL / [dspark-graph-capture]），
+  # 那两条只在 V1 的 proposer 里打印，V2 下恒为 0 —— 照抄 V1 会把成功判成失败。
+  n_v2=$(grep -c 'npu model runner v2 is in developing' "$LOG" || true)
+  n_v1mark=$(grep -c 'runtime_mode=FULL\|\[dspark-graph-capture\]' "$LOG" || true)
+  n_tgt=$(grep -oE 'Capturing CUDA graphs \(FULL\): 100%.*\| [0-9]+/[0-9]+' "$LOG" | grep -oE '[0-9]+/[0-9]+$' | cut -d/ -f1 | sort -u | tr '\n' ',' )
+  echo "[start] 校验：V2 worker 标记 ${n_v2}/${TP}，目标图 ${n_tgt:-<未找到>}"
+  echo "[start]       V1-only 标记应为 0：${n_v1mark}"
   grep -oE 'NPU KV cache size: [0-9,]+ tokens' "$LOG" | tail -1 || true
-  [ "$n_full" = "$TP" ] && [ "$n_cap" -ge "$TP" ] || {
-    echo "[start] FATAL: draft 没进图 —— 检查那 6 个 VLLM_ASCEND_DSPARK_* 是否都传了" >&2; exit 4; }
-  [ "$n_cap" = "$n_expect" ] || echo "[start] 警告：捕获 ${n_cap} 条 ≠ 期望 ${n_expect}，桶表可能没生效" >&2
+  [ "$n_v2" -ge 1 ] || {
+    echo "[start] FATAL: 日志里没有 V2 worker 标记，实际走的可能还是 V1" >&2
+    echo "[start]   查：docker exec $NAME env | grep V2_MODEL_RUNNER" >&2; exit 4; }
+  [ "$n_v2" -ge "$TP" ] || echo "[start] 警告：V2 标记只有 ${n_v2} 条，期望 ${TP}" >&2
+  [ "$n_v1mark" -eq 0 ] || echo "[start] 警告：出现 ${n_v1mark} 条 V1 专属日志行" >&2
 
   # prompt_tokens_details 也是静默失效型：没生效时 usage 里该字段恒为 null
   curl -s -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \
