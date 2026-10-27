@@ -10,6 +10,7 @@
 #   IMAGE=... MODEL=... WAIT=1 bash start-server.sh    # 前台等到 READY 并自检
 #   IMAGE=... MODEL=... FORCE=1 bash start-server.sh   # 先停旧容器
 #   BAT=8192 bash start-server.sh                      # 任何值都可用同名 env 覆盖
+#   KV_OFFLOAD=1 bash start-server.sh                  # 挂 KV 外部池（默认 2GB/卡）
 #
 # 必填：IMAGE（v0.30.0rc2 镜像）、MODEL（权重目录）
 # 停服务：docker stop "$NAME"    健康：curl -s -o /dev/null -w '%{http_code}\n' \
@@ -39,6 +40,19 @@ SRC_DIR="${SRC_DIR:-$HERE/tree}"          # 打补丁后的源码树放这里
 PGO_SO="${PGO_SO:-}"                      # 可选：PGO 版 libpython（见 README §5）
 LOG_DIR="${LOG_DIR:-$HERE/runtime/$(hostname -s)/$NAME}"
 IMAGE="$IMAGE"; export IMAGE MODEL
+
+# ---- KV 外部池（可选；KV_OFFLOAD=1 才启用）--------------------------------
+# 关掉时脚本行为与从前逐字一致：不建容器、不写 conf、不加任何 vllm 参数。
+KV_OFFLOAD="${KV_OFFLOAD:-0}"             # 1 = 挂 AscendStoreConnector + memcache
+KV_DRAM_GB="${KV_DRAM_GB:-2}"             # ★ 每 rank 的 DRAM 池，不是整机
+KV_PROTOCOL="${KV_PROTOCOL:-host_shm}"    # 见下方注释，别改
+KV_WORLD_SIZE="${KV_WORLD_SIZE:-256}"     # 可登记的总 rank 上限，改了要重启 meta
+KV_META_NAME="${KV_META_NAME:-${NAME}-mmc-meta}"
+KV_META_PORT="${KV_META_PORT:-5100}"
+KV_STORE_PORT="${KV_STORE_PORT:-6100}"
+KV_METRICS_PORT="${KV_METRICS_PORT:-8100}"   # 不能是 8000，会和 vllm 端口撞
+KV_CONF_DIR="${KV_CONF_DIR:-$LOG_DIR/kv}"
+KV_CONF_IN_CT="${KV_CONF_IN_CT:-/workspace/kvconf}"
 
 # decode 桶表：上游 27 桶 + 补 7 个 6N（draft 一步吃 num_reqs×(1+SPEC_TOKENS) 个 token，
 # 缺 6N 时 ACL graph 补位会把 draft 打回 eager，实测每输出时延 +26%）。
@@ -71,12 +85,46 @@ mkdir -p "$LOG_DIR/logs/ascend_plog" "$LOG_DIR/logs/ascend_npulog" \
 LOG="$LOG_DIR/logs/server-$(date '+%Y%m%d-%H%M%S').log"
 
 # ---- 已有一个吃 8 卡的容器就别重复起 -------------------------------------
+# 只查 $NAME 是不够的：本机可能还跑着**另一个名字**的 8 卡容器（实测：工作区
+# 那边是 dsv41-rc2，本脚本默认 NAME=dsv41）。那样 FORCE=1 停不掉它，于是两个
+# 容器同时抢 8 张卡和 8000 端口 —— 起服会以各种奇怪方式失败（HBM 不够 /
+# 端口占用 / HCCL 初始化超时），而且要好几分钟才发现。
+#
+# ALLOW_FOREIGN：本机常驻、与本服务无争用的容器白名单（空格分隔）。
+#   deepseek-v4 是 2026-08 起的陈旧容器，只占着设备节点、不做推理（AGENTS.md
+#   记为"与本工作区无关，别去动"），所以默认放行。真要连它一起管就置空。
+ALLOW_FOREIGN="${ALLOW_FOREIGN-deepseek-v4}"
 if [ -n "$(docker ps -q -f "name=^${NAME}$" 2>/dev/null || true)" ]; then
   if [ "${FORCE:-0}" = "1" ]; then
     echo "[start] FORCE=1 -> docker stop -t 30 $NAME"; docker stop -t 30 "$NAME" >/dev/null
   else
     echo "[start] 容器 $NAME 已在运行；要重启：FORCE=1 bash $0" >&2; exit 1
   fi
+fi
+
+# 本机上除了 $NAME 和白名单，还有没有别的容器占着 davinci 设备？
+foreign_host=""
+for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+  [ "$c" = "$NAME" ] && continue
+  case " $ALLOW_FOREIGN " in *" $c "*) continue ;; esac
+  if docker inspect -f '{{json .HostConfig.Devices}}' "$c" 2>/dev/null | grep -q '/dev/davinci0'; then
+    foreign_host="$foreign_host $c"
+  fi
+done
+if [ -n "$foreign_host" ]; then
+  echo "FATAL: 本机还有别的容器占着 8 张卡:$foreign_host" >&2
+  echo "       FORCE=1 只会停 $NAME，停不掉它们。同机只能有一个吃 8 卡的容器。" >&2
+  echo "       先停掉：docker stop$foreign_host" >&2
+  echo "       若其中某个确实与本服务无争用，加白名单：" >&2
+  echo "         ALLOW_FOREIGN=\"\$ALLOW_FOREIGN <名字>\" bash $0" >&2
+  exit 2
+fi
+# 端口：走到这里说明 $NAME 不在跑，那么 $PORT 上如果有人在听就是外来的
+if ss -ltn 2>/dev/null | grep -q ":${PORT} "; then
+  echo "FATAL: 端口 ${PORT} 已被占用（且 $NAME 未在运行）" >&2
+  echo "       查：ss -ltnp | grep :${PORT}" >&2
+  echo "       换端口：PORT=8001 bash $0" >&2
+  exit 2
 fi
 
 # ---- 源码树：首次从镜像里取出 stock 树，再打两个补丁 ----------------------
@@ -167,6 +215,118 @@ if [ -n "$PGO_SO" ]; then
   echo "[start] pgo=1 $(md5sum "$PGO_SO" | cut -c1-12)"
 fi
 
+# ---- KV 外部池（KV_OFFLOAD=1 才启用）-------------------------------------
+# 三件事缺一不可，缺任何一件 vllm 都会在 engine 初始化时 assert 死：
+#   ① MetaService 容器（5100/6100/8100，不占卡）
+#   ② 一份 mmc-local.conf，路径经 MMC_LOCAL_CONFIG_PATH 传给引擎
+#   ③ --kv-transfer-config '{"kv_connector":"AscendStoreConnector",...}'
+#
+# 配置里几个**实测踩过的**坑，写死在下面的模板里：
+#   · protocol 必须 host_shm
+#       host_rdma 的 extend 库在镜像是 0 字节（LoadExtendLibrary failed: -6）；
+#       device_rdma 单 rank 能过、8 rank 必 segfault（RaSocketBatchConnect）。
+#   · dram.size 是**每 rank**，8 卡要 ×8 内存。默认 2GB/rank ⇒ 整机 16GB。
+#       A3 要求对齐 1GB，host_shm 对齐 2MB，2GB 两边都满足。
+#   · metrics_url 不能是 8000，会跟 vllm 的 --port 撞；用 8100。
+#   · 不要用 docker run -e LD_LIBRARY_PATH 指 memfabric，会覆盖 CANN 路径
+#       ⇒ ImportError: libhccl.so。
+KV_MOUNTS=()
+KV_ENVS=()
+KV_ARGS=()
+if [ "$KV_OFFLOAD" = "1" ]; then
+  mkdir -p "$KV_CONF_DIR"
+  cat > "$KV_CONF_DIR/mmc-local.conf" <<EOF
+ock.mmc.meta_service_url = tcp://127.0.0.1:${KV_META_PORT}
+ock.mmc.local_service.config_store_url = tcp://127.0.0.1:${KV_STORE_PORT}
+ock.mmc.log_level = info
+ock.mmc.local_service.world_size = ${KV_WORLD_SIZE}
+ock.mmc.local_service.protocol = ${KV_PROTOCOL}
+ock.mmc.local_service.dram.size = ${KV_DRAM_GB}GB
+EOF
+  cat > "$KV_CONF_DIR/mmc-meta.conf" <<EOF
+ock.mmc.meta_service_url = tcp://127.0.0.1:${KV_META_PORT}
+ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:${KV_STORE_PORT}
+ock.mmc.meta_service.metrics_url = http://127.0.0.1:${KV_METRICS_PORT}
+ock.mmc.log_level = info
+EOF
+  echo "[start] kv_offload=1 protocol=$KV_PROTOCOL dram=${KV_DRAM_GB}GB/rank (整机 $((KV_DRAM_GB * TP))GB)"
+  echo "[start]           conf=$KV_CONF_DIR/mmc-local.conf"
+
+  KV_ENVS=(-e MMC_LOCAL_CONFIG_PATH="$KV_CONF_IN_CT/mmc-local.conf")
+  KV_MOUNTS=(-v "$KV_CONF_DIR:$KV_CONF_IN_CT:ro")
+  KV_ARGS=(--kv-transfer-config
+    "{\"kv_connector\":\"AscendStoreConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"backend\":\"memcache\"}}")
+
+  # MetaService 必须**先于** vllm 起，且比它活得久。已在跑就复用（不重启，
+  # 重启会丢掉所有已登记的 rank 与池内容）。
+  if [ "$(docker inspect -f '{{.State.Running}}' "$KV_META_NAME" 2>/dev/null || true)" = "true" ]; then
+    # 复用前必须确认它监听的端口和我们刚写的 local conf 一致，否则引擎会连到
+    # 一个不存在的端口 —— 那种失败发生在起服 8 分钟后，代价很大。
+    # 配置路径可能在 .Config.Env，也可能写在 bash -c 的字符串里（手工起的容器
+    # 就是后者），所以先两处都找，找不到就退化成"端口在听"这个弱判据。
+    meta_conf=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$KV_META_NAME" 2>/dev/null \
+                | sed -n 's/^MMC_META_CONFIG_PATH=//p' | head -1)
+    [ -n "$meta_conf" ] || meta_conf=$(docker inspect -f '{{join .Config.Cmd " "}}' "$KV_META_NAME" 2>/dev/null \
+                | tr ' ' '\n' | sed -n 's/^MMC_META_CONFIG_PATH=//p' | head -1)
+    meta_ports=""
+    if [ -n "$meta_conf" ]; then
+      meta_ports=$(docker exec "$KV_META_NAME" cat "$meta_conf" 2>/dev/null \
+                   | sed -n 's/.*tcp:\/\/127\.0\.0\.1:\([0-9]*\).*/\1/p;s#.*metrics_url.*:\([0-9]*\).*#\1#p' \
+                   | sort -u | paste -sd, -)
+    fi
+    if [ -z "$meta_ports" ]; then
+      # 弱判据：本次要用的三个端口必须都在听，否则一定连不上。
+      miss=""
+      for p in "$KV_META_PORT" "$KV_STORE_PORT" "$KV_METRICS_PORT"; do
+        ss -ltn 2>/dev/null | grep -q ":$p " || miss="$miss $p"
+      done
+      if [ -n "$miss" ]; then
+        echo "FATAL: 复用的 meta 容器 $KV_META_NAME 上这些端口没在听:$miss" >&2
+        echo "       它启动时用的端口可能与本次不同。二选一：" >&2
+        echo "       ① 改 KV_META_NAME 另起一个；② docker rm -f $KV_META_NAME 后重跑" >&2
+        exit 6
+      fi
+      echo "[start] meta 容器 $KV_META_NAME 在运行，端口 $KV_META_PORT/$KV_STORE_PORT/$KV_METRICS_PORT 均在听，复用"
+    else
+      want_ports=$(printf '%s\n%s\n%s\n' "$KV_META_PORT" "$KV_STORE_PORT" "$KV_METRICS_PORT" | sort -u | paste -sd, -)
+      if [ "$meta_ports" != "$want_ports" ]; then
+        echo "FATAL: 已存在的 meta 容器 $KV_META_NAME 端口是 [$meta_ports]，本次要 [$want_ports]" >&2
+        echo "       复用它会导致引擎连不上。二选一：" >&2
+        echo "       ① 改 KV_META_NAME 另起一个；② docker rm -f $KV_META_NAME 后重跑" >&2
+        exit 6
+      fi
+      echo "[start] meta 容器 $KV_META_NAME 已在运行且端口匹配 [$meta_ports]，复用"
+    fi
+  elif [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[start] DRY_RUN：将启动 meta 容器 $KV_META_NAME（$KV_META_PORT/$KV_STORE_PORT/$KV_METRICS_PORT）"
+  else
+    docker rm -f "$KV_META_NAME" >/dev/null 2>&1 || true
+    echo "[start] 启动 meta 容器 $KV_META_NAME"
+    docker run -d --name "$KV_META_NAME" --network host --restart unless-stopped \
+      -e MMC_META_CONFIG_PATH="$KV_CONF_IN_CT/mmc-meta.conf" \
+      -v "$KV_CONF_DIR:$KV_CONF_IN_CT:ro" \
+      --entrypoint bash "$IMAGE" -c \
+      'exec python -c "from memcache_hybrid import MetaService; MetaService.main()"' >/dev/null
+  fi
+
+  if [ "${DRY_RUN:-0}" != "1" ]; then
+    # 等 meta 的 metrics 端口起来。起来不了就别浪费 9 分钟去起 vllm。
+    kv_ready=0
+    for _ in $(seq 1 60); do
+      if curl -sf --max-time 2 "http://127.0.0.1:${KV_METRICS_PORT}/metrics" >/dev/null 2>&1; then
+        kv_ready=1; break
+      fi
+      sleep 1
+    done
+    if [ "$kv_ready" != "1" ]; then
+      echo "FATAL: meta 容器 60s 内未就绪（metrics :$KV_METRICS_PORT 不通）" >&2
+      echo "       看：docker logs --tail 40 $KV_META_NAME" >&2
+      exit 6
+    fi
+    echo "[start] meta 就绪 :$KV_META_PORT/:$KV_STORE_PORT/:$KV_METRICS_PORT"
+  fi
+fi
+
 read -r -a PASSTHRU_ENVS <<< "$PASSTHRU_ENVS_STR"
 
 COMPILATION_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[${CUDAGRAPH_SIZES}]}"
@@ -189,6 +349,7 @@ RUN_ARGS=(
   -e LOCAL_WORLD_SIZE="$TP"
   -e LD_PRELOAD="${JEMALLOC:-/usr/lib/aarch64-linux-gnu/libjemalloc.so.2}"
   "${PASSTHRU_ENVS[@]}"
+  "${KV_ENVS[@]}"
   "${PGO_MOUNTS[@]}"
   -v /usr/local/dcmi:/usr/local/dcmi:ro
   -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro
@@ -198,6 +359,7 @@ RUN_ARGS=(
   -v /etc/ascend_install.info:/etc/ascend_install.info:ro
   -v /etc/hccn.conf:/etc/hccn.conf:ro
   -v /tmp:/tmp
+  "${KV_MOUNTS[@]}"
   -v "$MODEL:$MODEL:ro"
   -v "$LOG_DIR/run:/workspace/run:rw"
   -v "$LOG_DIR/logs:/workspace/logs:rw"
@@ -222,6 +384,7 @@ RUN_ARGS=(
   --additional-config "$ADDL_JSON"
   --speculative-config "$SPEC_JSON"
   --enable-prompt-tokens-details
+  "${KV_ARGS[@]}"
   "$@"     # 透传额外 vllm serve 参数，例如 KV offload：
            #   bash start-server.sh \
            #     --kv-transfer-config '{"kv_connector":"AscendStoreConnector",...}'
@@ -238,6 +401,13 @@ fi
   echo "[start] $(date '+%F %T %Z') host=$(hostname -s) image=$IMAGE model=$MODEL"
   echo "[start] bat=$BAT maxlen=$MAXLEN max_seqs=$MAX_SEQS util=$GPU_UTIL spec=$SPEC_TOKENS block=$BLOCK"
   echo "[start] src=$SRC_DIR"
+  # 用 if/else 而不是 `[ ... ] && echo`：后者在本块里虽然不会被 set -e 打断
+  # （&& 链里非末位的命令被豁免），但读起来像"可能静默退出"，改成显式分支。
+  if [ "$KV_OFFLOAD" = "1" ]; then
+    echo "[start] kv_offload=1 ${KV_DRAM_GB}GB/rank $KV_PROTOCOL meta=$KV_META_NAME"
+  else
+    echo "[start] kv_offload=0"
+  fi
 } > "$LOG"
 
 echo "[start] 起服中（8 卡图捕获，实测约 9~11 min 到 READY）"
@@ -279,6 +449,20 @@ if [ "${WAIT:-0}" = "1" ]; then
     echo "[start]   查：docker exec $NAME env | grep V2_MODEL_RUNNER" >&2; exit 4; }
   [ "$n_v2" -ge "$TP" ] || echo "[start] 警告：V2 标记只有 ${n_v2} 条，期望 ${TP}" >&2
   [ "$n_v1mark" -eq 0 ] || echo "[start] 警告：出现 ${n_v1mark} 条 V1 专属日志行" >&2
+
+  # KV 池也是"静默失效"型：connector 名字打出来了但池没连上，服务照样起、
+  # 只是每次都没命中，收益全丢。三条都要过才是真生效。
+  if [ "$KV_OFFLOAD" = "1" ]; then
+    n_conn=$(grep -c 'Creating v1 connector with name: AscendStoreConnector' "$LOG" || true)
+    n_reg=$(grep -c 'RegisterBaseInfo.*register capacity' "$LOG" || true)
+    d_hit=$(grep -c 'use_hybrid: True' "$LOG" || true)
+    cap=$(curl -sf --max-time 3 "http://127.0.0.1:${KV_METRICS_PORT}/metrics" 2>/dev/null \
+          | awk -F'[{} ]' '/^memcache_total_capacity_bytes/{s+=$NF} END{printf "%.1f", s/1073741824}')
+    echo "[start] 校验：AscendStore connector ${n_conn}/${TP}，rank 登记 ${n_reg}，池容量 ${cap:-?} GiB"
+    [ "$n_conn" -ge "$TP" ] || { echo "[start] FATAL: connector 只建了 ${n_conn} 个，期望 ${TP}" >&2; exit 7; }
+    [ "$n_reg" -ge "$TP" ] || { echo "[start] FATAL: 只有 ${n_reg} 个 rank 登记到 meta，池没真正接上" >&2; exit 7; }
+    [ "$d_hit" -ge "$TP" ] || echo "[start] 警告：use_hybrid 行只有 ${d_hit} 条，期望 ${TP}" >&2
+  fi
 
   # prompt_tokens_details 也是静默失效型：没生效时 usage 里该字段恒为 null
   curl -s -X POST "http://127.0.0.1:${PORT}/v1/chat/completions" \

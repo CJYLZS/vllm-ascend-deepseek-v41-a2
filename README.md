@@ -38,17 +38,18 @@
 ### 0.2 用补丁 / 加卸载 / 升级基线
 
 ```bash
-# 普通起服（默认序列）
+# 普通起服（默认序列，不挂 KV 池）
 bash start-server.sh
 
-# 加 KV offload 外部池：直接透传 vllm 参数，不用改脚本
-bash start-server.sh \
-  --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both",
-                         "kv_connector_extra_config":{"backend":"memcache"}}'
+# 加 KV offload 外部池：一个开关，MetaService 容器 + conf + vllm 参数全自动
+KV_OFFLOAD=1 bash start-server.sh
+KV_OFFLOAD=1 KV_DRAM_GB=4 bash start-server.sh     # 池大小：4GB/卡 ⇒ 整机 32GB
 
 # 临时不启用某个补丁：注释掉 series.conf 里那一行即可
 #   （改完指纹会自动变，下次起服重建 tree/，不会再出现"改了没生效"）
 ```
+
+> `KV_OFFLOAD` 默认 **0**，关掉时脚本行为与从前逐字一致（不建容器、不写 conf、不加参数）。
 
 **升级基线（例如 0.31.0rc1）**：`tree/` 是**真 git 克隆**，用它做 rebase 比 `patch -p1` 精确：
 
@@ -83,6 +84,68 @@ MRV2 通过 `scheduled_new_reqs` 带**完整 block 表**恢复被抢占的请求
 
 修复 2 行、门控在 `use_v2_model_runner` 下（MRV1 走 `_process_preempted_cached_request`，
 不受影响）。本包附 `tests/ut/distributed/ascend_store/test_mrv2_preempt_marker.py` 覆盖它。
+
+### 0.4 KV offload 起服手册（`KV_OFFLOAD=1`）
+
+三件事缺一不可，脚本会全部自动处理；**缺任何一件，vllm 都会在 engine 初始化时
+（起服约 8 分钟后）`assert res == 0` 死掉**，所以脚本把能前置的全部前置了。
+
+| 项 | 脚本行为 |
+|---|---|
+| MetaService 容器 `<NAME>-mmc-meta` | 不存在则起；已存在则**先校验端口匹配**再复用（不重启，重启会丢池内容） |
+| `mmc-local.conf` / `mmc-meta.conf` | 生成到 `runtime/<HOST>/<NAME>/kv/`，只读挂到 `/workspace/kvconf` |
+| `-e MMC_LOCAL_CONFIG_PATH` | 指向挂载后的 conf |
+| `--kv-transfer-config` | `AscendStoreConnector` + `kv_both` + `memcache` |
+| 就绪闸门 | 等 `:<metrics>/metrics` 起来，60 s 不行就 `exit 6`（不浪费 9 min） |
+
+**可调变量**（都给默认值）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `KV_DRAM_GB` | **2** | ★ **每 rank** 的 DRAM 池；8 卡 ⇒ 整机 16 GB |
+| `KV_PROTOCOL` | `host_shm` | 见下，别改 |
+| `KV_WORLD_SIZE` | 256 | 可登记 rank 上限，改了要重启 meta |
+| `KV_META_PORT` / `KV_STORE_PORT` / `KV_METRICS_PORT` | 5100 / 6100 / **8100** | metrics 不能是 8000，会和 `--port` 撞 |
+
+#### 四个写死在模板里的坑（各踩过一次起服）
+
+1. **`protocol` 必须 `host_shm`**。`host_rdma` 的 extend 库在镜像是 **0 字节**
+   （`LoadExtendLibrary for HOST RDMA failed: -6`）；`device_rdma` 单 rank 能过、
+   **8 rank 必 segfault**（`RaSocketBatchConnect`）—— 别用单 rank 结论外推。
+2. **`dram.size` 是每 rank**。写 `8GB` 以为是整机，实际要 64 GiB ⇒
+   `halMemAlloc failed, ret:6`。
+3. **不要 `docker run -e LD_LIBRARY_PATH=...`**。它会覆盖镜像的 CANN 路径 ⇒
+   `ImportError: libhccl.so`，15 s 退出。本脚本不设这个变量。
+4. **`metrics_url` 别用 8000**。镜像自带模板 `mmc-meta.conf` 就是 8000，直接 `cp`
+   会跟 vllm 抢端口。
+
+#### 怎么确认"真的生效了"（`WAIT=1` 已自动校验）
+
+池是**静默失效**型：connector 名字打出来了但池没连上，服务照常起、只是永远不命中。
+三条同时成立才算真生效：
+
+```bash
+# ① 8 个 rank 都建了 connector
+grep -c 'Creating v1 connector with name: AscendStoreConnector' <log>     # 期望 = 8
+# ② 8 个 rank 都向 meta 登记了容量（这条才是"池真接上了"）
+grep -c 'RegisterBaseInfo.*register capacity' <log>                       # 期望 = 8
+# ③ meta 侧容量对得上：KV_DRAM_GB × 8
+curl -s http://127.0.0.1:8100/metrics | grep '^memcache_total_capacity_bytes'
+```
+
+命中效果则看指标（跑完一轮压测后再看）：
+
+```bash
+curl -s http://127.0.0.1:8100/metrics | grep -E \
+  'memcache_(allocated_bytes|alloc_successes_total|batch_query_not_found_total|evict_operations_total)'
+```
+
+> ⚠ **池容量口径**：全量 KV 是 `29963 block × 1 MiB = 29.26 GiB/机`。
+> 2 GB/rank（16 GB/机）≈ 全量的 55%；这个尺寸下单轮 8K 压测就会开始驱逐。
+> 驱逐只丢块、不损坏正确性。
+
+> ⚠ **正确性判据必须用首 token**。同 prompt 连发 4 次（全命中）会有 2 种输出，
+> 差别仅在"但最后问"/"后问"这类同义抖动 —— 整段比对不可靠。
 
 ## 0. 实测数据
 
