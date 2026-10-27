@@ -6,15 +6,83 @@
 
 | 文件 | 说明 |
 |---|---|
-| `vllm-ascend.patch` | vllm-ascend 侧，8 文件 +411/−64 |
+| `series.conf` | **补丁序列（唯一入口）**：按行声明启用哪些 patch，`#` 注释 |
+| `patches/0001..0004` | 性能/功能优化（默认启用） |
+| `patches/0101-*` | **KV offload 修复**（仅挂 `--kv-transfer-config` 时需要） |
+| `tests/` | 本包自带回归用例（`test_mrv2_preempt_marker.py`） |
 | `vllm.patch` | vllm 侧，1 文件 +76/−4 |
+| `legacy/vllm-ascend.monolithic.patch` | **已废弃**：旧的单个大补丁，仅作考古/回退 |
 | `start-server.sh` | 起服脚本（镜像 / 权重 / 端口全部由环境变量传入） |
 | `README.md` | 本文件 |
 
 基线 commit：`vllm-ascend v0.30.0rc2`（`8fde6d4e3`）、`vllm v0.30.0`（`ced6857af`）。
-两个补丁只含本地改动，不含任何上游新提交。
+补丁只含本地改动，不含任何上游新提交。
+
+### 0.1 为什么拆成 `patches/` + `series.conf`（2026-10-27 重构）
+
+原来是一个 `vllm-ascend.patch`（8 文件 +411/−64）。拆分的三个理由：
+
+1. **可分层**：`0xxx` 是纯优化、`1xxx` 是 KV offload。不挂池时不必承担 `1xxx`。
+2. **可演进**：升级基线时按「上游 churn」逐个评估，而不是重做一整块。
+   实测 `v0.30.0rc2 → main`（452 提交）的 churn：
+   `dsa_v1.py` **11 提交/+623−159**（重灾区）、`dsa_v41.py` 5/+153−4、
+   `model.py` 7/+46−1、`rope_dsv4.py` 1，
+   而 `engram/layer.py`、`indexer.py`、`token_dispatcher.py` **各 0 提交 ⇒ 零冲突**。
+3. **可核对**：拆开后每个 patch 一个主题，review 与回退都以主题为单位。
+
+> 拆分经过等价性验证：按 `series.conf` 顺序应用后的源码树，
+> 与旧单个 `.patch` 应用后的结果 `diff -r` **零差异**。
 
 ---
+
+### 0.2 用补丁 / 加卸载 / 升级基线
+
+```bash
+# 普通起服（默认序列）
+bash start-server.sh
+
+# 加 KV offload 外部池：直接透传 vllm 参数，不用改脚本
+bash start-server.sh \
+  --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both",
+                         "kv_connector_extra_config":{"backend":"memcache"}}'
+
+# 临时不启用某个补丁：注释掉 series.conf 里那一行即可
+#   （改完指纹会自动变，下次起服重建 tree/，不会再出现"改了没生效"）
+```
+
+**升级基线（例如 0.31.0rc1）**：`tree/` 是**真 git 克隆**，用它做 rebase 比 `patch -p1` 精确：
+
+```bash
+cd tree/vllm-ascend
+git checkout v0.31.0rc1          # 或对应 tag
+git checkout -b a2/v0.31.0rc1
+for p in $(grep -v '^#' ../series.conf | grep -v '^$'); do
+  git apply --3way ../patches/$p || echo "冲突: $p"   # --3way 给出精确冲突点
+done
+# 解决后导出为新基线的 patch 集：
+git format-patch v0.31.0rc1 -o ../patches-new/
+```
+
+按 §0.1 的 churn 判断优先级：
+**先看 `0004-model-opts`**（碰 `model.py`，7 提交）与 **`0002-dsa-v41`**（5 提交），
+`0003-dsa-v1-o-proj-2d` 冲突虽大但改动由 `VLLM_ASCEND_V41_O_PROJ_2D` 门控、默认关闭，
+**可以延后**；`0004` 里那三个零 churn 文件（`engram/layer.py`、`indexer.py`、`token_dispatcher.py`）
+可原样保留。
+
+> ⚠ 不要因为「V2 默认走 `dsa_v41`」就删掉 `0003`：`dsa_v1.py` 在 V2 下**确实会被 import**
+> （`worker/v2/attn_utils.py:64` 引用 `AscendDSAMetadataBuilder`）。
+
+### 0.3 KV offload 补丁 0101 说明
+
+上游 `vllm-ascend#19693`（commit `6197fec5c`）修的是 **MRV2 × KVPool** 的真实缺陷：
+
+MRV2 通过 `scheduled_new_reqs` 带**完整 block 表**恢复被抢占的请求，但 `KVPoolScheduler`
+重建 tracker 后没清 `_preempted_req_ids`。下一步 RUNNING 带着增量表进入抢占分支，
+**用增量覆盖完整表**，导致 `ReqMeta GVA metadata does not cover requested block range`，
+或把**错误的 block 关联到池 key**（静默算错，不崩溃）。
+
+修复 2 行、门控在 `use_v2_model_runner` 下（MRV1 走 `_process_preempted_cached_request`，
+不受影响）。本包附 `tests/ut/distributed/ascend_store/test_mrv2_preempt_marker.py` 覆盖它。
 
 ## 0. 实测数据
 
@@ -153,10 +221,16 @@ docker run --rm --entrypoint tar "$IMAGE" -C /vllm-workspace -cf - \
     --exclude='vllm-ascend/csrc/build_out' --exclude='vllm-ascend/csrc/output' \
     --exclude='vllm/rust/target' vllm-ascend vllm | tar -xf - -C "$SRC_DIR"
 
-# 再打两个补丁
-git -C "$SRC_DIR/vllm-ascend" apply vllm-ascend.patch
-git -C "$SRC_DIR/vllm"        apply vllm.patch
+# 再按 series.conf 顺序应用补丁
+for pf in $(grep -v '^#' series.conf | grep -v '^$'); do
+    git -C "$SRC_DIR/vllm-ascend" apply "patches/$pf"
+done
+git -C "$SRC_DIR/vllm" apply vllm.patch
 ```
+
+> 是否重建树由 **序列指纹**（`series.conf` + 各 patch 的 md5）决定，
+> 不是"标记文件存在就跳过"。改任何补丁都会自动重建 —— 旧实现只看文件存在，
+> 曾导致 v2 补丁已裁到 796 行、`tree/` 里仍是 v1 的 941 行改动却照用不误。
 
 **为什么不能 `git clone` 一份再打补丁**：本包的改动全在 Python 侧，但运行必需的构建产物
 不在 git 里（被 `.gitignore` 排除）：

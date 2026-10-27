@@ -1,0 +1,336 @@
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 8cd11c8c1..b675a53ef 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.kv_cache_interface import CircularBufferSpec
+ 
++from vllm_ascend import envs
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
+ from vllm_ascend.core.kv_cache_interface import (
+@@ -606,7 +607,7 @@ class AscendDSAV41Impl:
+             shared.topk_indices[: selected.shape[0]].fill_(-1)
+         elif not getattr(attn, "uses_a5_packed_cache", False):
+             shared.topk_indices[: selected.shape[0]].copy_(selected)
+-        if self.role.is_candidate_source:
++        if self.role.is_candidate_source and not envs.VLLM_ASCEND_V41_QLI_NO_CANDIDATE:
+             shared.candidates[: candidates.shape[0]].copy_(candidates)
+         return shared.topk_indices[: hidden_states.shape[0]]
+ 
+@@ -762,6 +763,12 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+             raise TypeError(f"Unsupported V4.1 cache spec: {type(kv_cache_spec).__name__}")
+         self._device_backend = DeviceOperator.get_dsv41_packed_cache_ops()
+         self._uses_a5_packed_cache = self._device_backend is not None
++        # The packed-cache Triton slot-mapping kernel is gated to the A5 backend
++        # upstream. Its contract is hardware-neutral (slot -> page/row + flat
++        # slot), so A3 can select it explicitly; measured on 910B3 it compiles
++        # and matches the eager chain on all ratio/skip combinations, at one
++        # launch instead of ~106 host ops per call.
++        self._triton_slot_mapping = bool(envs.VLLM_ASCEND_V41_TRITON_SLOT_MAPPING)
+         text_config = vllm_config.model_config.hf_text_config
+         window_size = int(_config_value(text_config, "sliding_window", 0))
+         query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
+@@ -811,12 +818,54 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+             if name.endswith(".compressor.state_cache")
+         )
+         self._c2_full_source_rope: tuple[torch.Tensor, torch.Tensor] | None = None
++        # ``build`` runs once per KV cache group per step (25+ times in a V4.1
++        # decode step), and it does not depend on the layer. Everything in it
++        # that is a function of the config alone is resolved once here: the
++        # HF config object is served by a patched ``__getattribute__`` whose
++        # missing-key fallback costs microseconds, so per-build reads add up.
++        self._text_config = text_config
++        self._const_window_size = window_size
++        # Resolved on first use (not here) so a cache layout that never builds
++        # query metadata keeps tolerating a missing config key, as before.
++        self._build_consts: dict[str, int] = {}
++        # ``torch.where(cond, x, <python scalar>)`` materialises the scalar as a
++        # 0-d device tensor on every call (~20 us each on NPU). Reuse one
++        # tensor per constant and dtype instead.
++        self._sentinel_tensors: dict[tuple[float, torch.dtype], torch.Tensor] = {}
++        self._device = device
+         self._device_metadata_enabled = False
+         # Default to eager preparation. MRV2 temporarily sets this during
+         # FULL warmup/capture so producers and consumer waits share one graph.
+         self._device_metadata_in_graph = False
+         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
+ 
++    def _sentinel(self, value: float, dtype: torch.dtype) -> torch.Tensor:
++        """Return one reusable 0-d constant for ``torch.where`` sentinels.
++
++        ``torch.where(cond, x, -1)`` rebuilds a 0-d device tensor from the
++        Python scalar on every call, which shows up as ``aten::scalar_tensor``
++        in decode profiles (~20 us each, tens per step). A cached 0-d tensor
++        of the same dtype broadcasts identically without that cost.
++        """
++        key = (value, dtype)
++        tensor = self._sentinel_tensors.get(key)
++        if tensor is None:
++            tensor = torch.full((), value, dtype=dtype, device=self._device)
++            self._sentinel_tensors[key] = tensor
++        return tensor
++
++    def _index_const(self, name: str) -> int:
++        """Resolve a config field once per builder and cache the integer."""
++        value = self._build_consts.get(name)
++        if value is None:
++            value = int(_config_value(self._text_config, name))
++            self._build_consts[name] = value
++        return value
++
++    def _n_local_heads(self) -> int:
++        """Attention heads owned by this rank (config read memoised)."""
++        return self._index_const("num_attention_heads") // self.vllm_config.parallel_config.tensor_parallel_size
++
+     @classmethod
+     def get_cudagraph_support(
+         cls,
+@@ -977,17 +1026,67 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+             slots = self._slot_mapping[:num_input_tokens]
+             flat_slots = None
+         else:
++            # Slot mapping preparation depends only on the common metadata,
++            # the compression ratio, the physical block size and the ring-state
++            # policy.
+             # Scope ``shared`` to one framework KV cache group in the model
+-            # runner. Long KV and Indexer builders with the same physical
+-            # layout then share one persistent [T, 2] mapping, while every SWA
+-            # group owns a distinct mapping buffer.
+-            slot_key = f"slot:coordinates:c{ratio}:b{storage_block_size}"
+-            flat_slot_key = f"slot:flat:c{ratio}:b{storage_block_size}"
++            # runner: every group owns its own physical blocks, so slot
++            # mappings are only interchangeable inside a group. Builders that
++            # resolve to the same layout there share one prepared mapping
++            # instead of rebuilding the chain (~3 ``where`` plus
++            # ``div``/``remainder``/``copy_``) into their own buffer.
++            skip_ring_update = kwargs.get("skip_ring_state_update", False)
++            slot_key = f"slot:coordinates:c{ratio}:b{storage_block_size}:s{int(skip_ring_update)}"
++            # The flat mapping has no physical-block component, so Long KV and
++            # Indexer builders with the same ratio share it even when their
++            # storage block sizes differ.
++            flat_slot_key = f"slot:flat:c{ratio}:s{int(skip_ring_update)}"
+             prepared_slots = shared.get(slot_key)
+             prepared_flat_slots = shared.get(flat_slot_key)
+             if prepared_slots is None or prepared_flat_slots is None:
+-                active_slots = common.slot_mapping[:num_input_tokens]
+-                if self._uses_a5_packed_cache and active_slots.device.type == "npu":
++                active_key = f"slot:active:c{ratio}"
++                active_slots = shared.get(active_key)
++                raw_slots = shared.get("slot:raw")
++                if raw_slots is None:
++                    raw_slots = common.slot_mapping[:num_input_tokens]
++                    shared["slot:raw"] = raw_slots
++                if active_slots is None:
++                    active_slots = raw_slots
++                    if compressed and ratio != 1:
++                        active_slots = compressed_slot_mapping(active_slots, ratio)
++                    shared[active_key] = active_slots
++                if (
++                    self._triton_slot_mapping
++                    and raw_slots.device.type == "npu"
++                    # The kernel dereferences ``positions`` for ratio 2, while
++                    # the eager chain only applies the parity mask when
++                    # positions is present. Keep the eager path for that case.
++                    and (positions is not None or not (compressed and ratio == 2))
++                ):
++                    # One launch instead of the eager ~100-op chain. The kernel
++                    # applies the compression-ratio rule itself, so it must see
++                    # the *raw* slot mapping: pre-compressing would apply
++                    # ``slot // ratio`` twice and resolve ratio-2 slots to
++                    # ``slot // 4``. A3 keeps the eager path unless
++                    # VLLM_ASCEND_V41_TRITON_SLOT_MAPPING=1.
++                    from vllm_ascend.ops.triton.packed_cache_slot_mapping import (
++                        build_packed_cache_slot_mapping,
++                    )
++
++                    prepared_slots, prepared_flat_slots = build_packed_cache_slot_mapping(
++                        raw_slots,
++                        positions,
++                        common.query_start_loc,
++                        num_input_tokens,
++                        num_actual_reqs,
++                        num_actual_tokens,
++                        storage_block_size,
++                        ratio if compressed else 1,
++                        skip_update=skip_ring_update,
++                        coordinates_output=self._slot_mapping_2d[:num_input_tokens],
++                        flat_output=self._flat_slot_mapping[:num_input_tokens],
++                    )
++                elif self._uses_a5_packed_cache and active_slots.device.type == "npu":
+                     assert self._device_backend is not None
+                     prepared_slots, prepared_flat_slots = self._device_backend.build_packed_cache_slot_mapping(
+                         active_slots,
+@@ -998,36 +1097,65 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+                         num_actual_tokens,
+                         storage_block_size,
+                         ratio if compressed else 1,
+-                        skip_update=kwargs.get("skip_ring_state_update", False),
++                        skip_update=skip_ring_update,
+                         coordinates_output=self._slot_mapping_2d[:num_input_tokens],
+                         flat_output=self._flat_slot_mapping[:num_input_tokens],
+                     )
+                 else:
+-                    if compressed and ratio != 1:
+-                        active_slots = compressed_slot_mapping(active_slots, ratio)
+-                    valid = active_slots >= 0
+-                    if compressed and ratio == 2:
+-                        if kwargs.get("skip_ring_state_update", False):
+-                            valid.zero_()
+-                        else:
+-                            valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
+-                            valid &= torch.arange(num_input_tokens, device=active_slots.device) < valid_end
+-                            if positions is not None:
+-                                valid &= positions.remainder(2) == 1
+-                    physical = active_slots.clamp_min(0)
+-                    self._slot_mapping_2d[:num_input_tokens, 0].copy_(
++                    valid_key = f"slot:valid:c{ratio}:s{int(skip_ring_update)}"
++                    valid = shared.get(valid_key)
++                    if valid is None:
++                        valid = active_slots >= 0
++                        if compressed and ratio == 2:
++                            if skip_ring_update:
++                                valid.zero_()
++                            else:
++                                valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
++                                token_ids = shared.get("slot:arange")
++                                if token_ids is None:
++                                    token_ids = torch.arange(num_input_tokens, device=active_slots.device)
++                                    shared["slot:arange"] = token_ids
++                                valid &= token_ids < valid_end
++                                if positions is not None:
++                                    valid &= positions.remainder(2) == 1
++                        shared[valid_key] = valid
++                    if prepared_slots is None:
++                        # ``out=`` requires the destination and both operands to
++                        # agree exactly, whereas ``copy_`` used to convert on the
++                        # way in. ``physical`` is int64 while the coordinate
++                        # buffer is int32, so narrow it once here: div and
++                        # remainder preserve an int32 input's dtype.
++                        physical = active_slots.clamp_min(0).to(self._slot_mapping_2d.dtype)
++                        neg = self._sentinel(-1, self._slot_mapping_2d.dtype)
++                        # ``torch.where(..., out=view)`` writes the column in
++                        # place. The ``where`` + ``copy_`` form costs three
++                        # extra host ops per call (a temporary allocation for
++                        # ``where`` plus the copy and its device dispatch), and
++                        # these run once per KV group per step. Measured on
++                        # NPU: 5 host ops -> 2, and the column view does not
++                        # have to be contiguous.
+                         torch.where(
+                             valid,
+                             torch.div(physical, storage_block_size, rounding_mode="floor"),
+-                            -1,
++                            neg,
++                            out=self._slot_mapping_2d[:num_input_tokens, 0],
+                         )
+-                    )
+-                    self._slot_mapping_2d[:num_input_tokens, 1].copy_(
+-                        torch.where(valid, physical.remainder(storage_block_size), -1)
+-                    )
+-                    self._flat_slot_mapping[:num_input_tokens].copy_(torch.where(valid, active_slots, -1))
+-                    prepared_slots = self._slot_mapping_2d[:num_input_tokens]
+-                    prepared_flat_slots = self._flat_slot_mapping[:num_input_tokens]
++                        torch.where(
++                            valid,
++                            physical.remainder(storage_block_size),
++                            neg,
++                            out=self._slot_mapping_2d[:num_input_tokens, 1],
++                        )
++                        prepared_slots = self._slot_mapping_2d[:num_input_tokens]
++                    if prepared_flat_slots is None:
++                        flat_neg = self._sentinel(-1, self._flat_slot_mapping.dtype)
++                        torch.where(
++                            valid,
++                            active_slots,
++                            flat_neg,
++                            out=self._flat_slot_mapping[:num_input_tokens],
++                        )
++                        prepared_flat_slots = self._flat_slot_mapping[:num_input_tokens]
+                 shared[slot_key] = prepared_slots
+                 shared[flat_slot_key] = prepared_flat_slots
+             slots = prepared_slots
+@@ -1057,15 +1185,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+                 rope = get_cos_and_sin_dsa(positions, use_cache=(coordinates["num_prefills"] == 0 or full_graph_mode))
+                 batch_shared["rope"] = rope
+             cos, sin = rope
+-        text_config = self.vllm_config.model_config.hf_text_config
+-        window_size = int(_config_value(text_config, "sliding_window", 0))
+-        n_local_heads = (
+-            int(_config_value(text_config, "num_attention_heads"))
+-            // self.vllm_config.parallel_config.tensor_parallel_size
+-        )
+-        n_local_heads = int(kwargs.get("num_query_heads", n_local_heads))
+-        head_dim = int(_config_value(text_config, "head_dim"))
+-        index_topk = int(_config_value(text_config, "index_topk"))
++        text_config = self._text_config
++        window_size = self._const_window_size
++        n_local_heads = int(kwargs.get("num_query_heads", self._n_local_heads()))
++        head_dim = self._index_const("head_dim")
++        index_topk = self._index_const("index_topk")
+         ori_sparse_indices = kwargs.get("ori_sparse_indices")
+         ori_topk_length = None
+         noncausal = not bool(getattr(common, "causal", True))
+@@ -1236,9 +1360,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+                         batch_size=num_reqs,
+                         max_seqlen_q=-1,
+                         max_seqlen_k=-1,
+-                        num_heads_q=int(_config_value(text_config, "index_n_heads")),
++                        num_heads_q=self._index_const("index_n_heads"),
+                         num_heads_k=1,
+-                        head_dim=int(_config_value(text_config, "index_head_dim")),
++                        head_dim=self._index_const("index_head_dim"),
+                         topk=index_topk,
+                         mask_mode=3,
+                         cmp_ratio=ratio,
+@@ -1252,9 +1376,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+ 
+                 def build_qli_metadata() -> None:
+                     value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+-                        int(_config_value(text_config, "index_n_heads")),
++                        self._index_const("index_n_heads"),
+                         1,
+-                        int(_config_value(text_config, "index_head_dim")),
++                        self._index_const("index_head_dim"),
+                         index_topk,
+                         2,
+                         cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
+@@ -1327,26 +1451,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+                 query_lens = ends - starts
+                 live = torch.arange(num_reqs, device=starts.device) < num_actual_reqs
+                 used = (ends.clamp_max(num_actual_tokens) - starts).clamp_min(0)
+-                used = torch.where(live, used, 0)
++                used = torch.where(live, used, self._sentinel(0, used.dtype))
+                 if skip_ring_update:
+                     used = torch.zeros_like(used)
+                 ring_meta[0].copy_((seq_lens - query_lens).clamp_min(0))
+                 ring_meta[1].copy_(used)
+                 ring_meta[2].copy_(starts)
+                 ring_meta[3].copy_(starts)
+-                ring_meta[4].copy_(torch.where(used > 0, common.block_table_tensor[:num_reqs, 0], 0))
++                torch.where(
++                    used > 0,
++                    common.block_table_tensor[:num_reqs, 0],
++                    self._sentinel(0, ring_meta.dtype),
++                    out=ring_meta[4],
++                )
+                 valid_end = common.query_start_loc[num_actual_reqs].clamp_max(num_actual_tokens)
+                 valid = torch.arange(num_input_tokens, device=input_positions.device) < valid_end
+                 complete = (input_positions.remainder(2) == 1) & valid
+                 if skip_ring_update:
+                     complete = torch.zeros_like(complete)
+                 self._c2_complete_mask[:num_input_tokens].copy_(complete)
+-                self._c2_source_positions[:num_input_tokens].copy_(
+-                    torch.where(
+-                        complete,
+-                        input_positions - 1,
+-                        torch.zeros_like(input_positions),
+-                    )
++                torch.where(
++                    complete,
++                    input_positions - 1,
++                    self._sentinel(0, input_positions.dtype),
++                    out=self._c2_source_positions[:num_input_tokens],
+                 )
+                 if full_source_cos is not None and full_source_sin is not None:
+                     gather_idx = (

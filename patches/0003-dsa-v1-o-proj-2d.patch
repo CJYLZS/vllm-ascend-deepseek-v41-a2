@@ -1,0 +1,71 @@
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index eb2f4b6b5..3811fd57d 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -1,4 +1,5 @@
+ import math
++import os
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
+@@ -61,6 +62,12 @@ from vllm_ascend.worker.device_metadata import (
+ )
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ 
++# [O_PROJ_2D] F3: degenerate batch matmul -> 2D matmul when a rank holds exactly
++# one o-projection group. Ported from
++# deepseek-v4.1-flash-ascend910B:patches/files/dsa_v1.py (`V41_O_PROJ_2D`).
++# Optimisation switch only; default off keeps the upstream batch-matmul path.
++_O_PROJ_2D = os.environ.get("VLLM_ASCEND_V41_O_PROJ_2D", "0") == "1"
++
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import SchedulerOutput
+ 
+@@ -1756,6 +1763,31 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             batch_split_factor=1,
+         )
+ 
++    def _wo_a_2d(self, o_proj_input: torch.Tensor) -> torch.Tensor:
++        """[O_PROJ_2D] Degenerate batch matmul -> plain 2D matmul (n_local_groups == 1).
++
++        Ported from deepseek-v4.1-flash-ascend910B:patches/files/dsa_v1.py (F3,
++        `V41_O_PROJ_2D`). With a single local group the permuted batch matmul
++        `npu_transpose_batchmatmul([T, 1, H] x [1, H, R], perm=(1,0,2))` reduces
++        to `x @ w`, so a 2D GEMM is numerically identical and avoids the
++        batch-matmul tiling overhead. The transpose for the dummy 2D layout is
++        cached: doing it per call added a Transpose to every step.
++        """
++        _w = self.wo_a.weight
++        _w2d = getattr(self, "_o_proj_2d_weight", None)
++        if _w2d is None:
++            if _w.dim() == 3 and _w.shape[0] == 1:
++                _w2d = _w.squeeze(0)
++            elif _w.dim() == 2:
++                # `--load-format dummy` skips weight_loader, so the weight keeps
++                # its declared 2D layout [o_lora_rank, group_hidden]; a real 3D
++                # load never reaches this branch.
++                _w2d = _w.t().contiguous()
++            else:
++                _w2d = _w.reshape(-1, _w.shape[-1])
++            self._o_proj_2d_weight = _w2d
++        return torch.matmul(o_proj_input.reshape(o_proj_input.shape[0], -1), _w2d)
++
+     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+         num_tokens = o_proj_input.shape[0]
+         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
+@@ -1832,7 +1864,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             dist.reduce_scatter_tensor(self._oproj_rs_out_buf, o_proj_output, group=oproj_group.device_group)
+             output[...] = self._oproj_rs_out_buf[:num_tokens]
+         else:
+-            o_proj_input = self._wo_a_bmm(o_proj_input)
++            if (
++                _O_PROJ_2D
++                and self.n_local_groups == 1
++                and not (self.support_fp8_attention and _has_weight_scale(self.wo_a))
++            ):
++                o_proj_input = self._wo_a_2d(o_proj_input)
++            else:
++                o_proj_input = self._wo_a_bmm(o_proj_input)
+             o_proj_input = o_proj_input.reshape(num_tokens, -1)
+             output[...] = self.wo_b(o_proj_input)
+         return output

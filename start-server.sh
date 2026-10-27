@@ -83,7 +83,33 @@ fi
 # 为什么要这一步：v25 的改动全在 Python 侧，但运行必需的 .so（C 扩展、CANN 算子、
 # rust parser）在镜像里、且被 .gitignore 排除 ⇒ 打补丁的树必须**基于镜像自带的树**
 # 才配对。从镜像里 tar 出来（排除编译中间产物）再 apply，大小约 0.6 GB。
-if [ "${SKIP_PREPARE:-0}" != "1" ] && [ ! -f "$SRC_DIR/.patches-applied" ]; then
+# 序列指纹：series.conf + 每个 patch 的内容哈希。
+# 旧实现只看 .patches-applied **文件是否存在**，改了补丁却不重建树 ⇒ 静默用旧树。
+# 真实事故：v2 把补丁从 1788 行裁到 796 行，tree/ 里仍是 v1 的改动（941 行），
+# 脚本照用不误。现在改为内容一致才跳过。
+series_fingerprint() {
+  local list
+  list=$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$HERE/series.conf")
+  {
+    printf '%s\n' "$list"
+    local f
+    for f in $list; do
+      if [ -f "$HERE/patches/$f" ]; then
+        md5sum "$HERE/patches/$f"
+      else
+        echo "MISSING $f"
+      fi
+    done
+    md5sum "$HERE/vllm.patch" 2>/dev/null
+  } | md5sum | cut -d' ' -f1
+}
+
+WANT_FP=$(series_fingerprint)
+# 注意：脚本是 set -euo pipefail。`cat missing | head` 在 pipefail 下返回非 0
+# 会让赋值失败并静默退出，所以用 `|| true` 兜住"标记文件不存在"这个正常情况。
+HAVE_FP=$(head -1 "$SRC_DIR/.patches-applied" 2>/dev/null || true)
+
+if [ "${SKIP_PREPARE:-0}" != "1" ] && [ "$WANT_FP" != "$HAVE_FP" ]; then
   echo "[start] 准备源码树 -> $SRC_DIR（首次约 1 min，约 0.6 GB）"
   mkdir -p "$SRC_DIR/vllm-ascend" "$SRC_DIR/vllm"
   docker run --rm --entrypoint tar "$IMAGE" -C /vllm-workspace -cf - \
@@ -92,18 +118,28 @@ if [ "${SKIP_PREPARE:-0}" != "1" ] && [ ! -f "$SRC_DIR/.patches-applied" ]; then
       --exclude='vllm/rust/target' vllm-ascend vllm \
     | tar -xf - -C "$SRC_DIR"
 
-  for p in vllm-ascend.patch vllm.patch; do
-    [ -f "$HERE/$p" ] || { echo "FATAL: 缺补丁 $HERE/$p" >&2; exit 1; }
-  done
+  [ -f "$HERE/vllm.patch" ] || { echo "FATAL: 缺补丁 $HERE/vllm.patch" >&2; exit 1; }
+  # 按 series.conf 顺序逐个应用（分层：0xxx 优化 / 1xxx KV offload）
+  while read -r pf; do
+    case "$pf" in ''|'#'*) continue ;; esac
+    [ -f "$HERE/patches/$pf" ] || { echo "FATAL: series 里的 $pf 不存在" >&2; exit 1; }
+    if command -v git >/dev/null 2>&1; then
+      git -C "$SRC_DIR/vllm-ascend" apply "$HERE/patches/$pf" \
+        || { echo "FATAL: git apply 失败 $pf（用 DRY_RUN=1 或手工检查）" >&2; exit 1; }
+    else
+      patch -p1 -d "$SRC_DIR/vllm-ascend" < "$HERE/patches/$pf" \
+        || { echo "FATAL: patch 失败 $pf" >&2; exit 1; }
+    fi
+    echo "[start]   applied $pf"
+  done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$HERE/series.conf")
+
   if command -v git >/dev/null 2>&1; then
-    git -C "$SRC_DIR/vllm-ascend" apply "$HERE/vllm-ascend.patch"
-    git -C "$SRC_DIR/vllm"        apply "$HERE/vllm.patch"
+    git -C "$SRC_DIR/vllm" apply "$HERE/vllm.patch" || { echo "FATAL: git apply 失败 vllm.patch" >&2; exit 1; }
   else
-    patch -p1 -d "$SRC_DIR/vllm-ascend" < "$HERE/vllm-ascend.patch"
-    patch -p1 -d "$SRC_DIR/vllm"        < "$HERE/vllm.patch"
+    patch -p1 -d "$SRC_DIR/vllm" < "$HERE/vllm.patch" || { echo "FATAL: patch 失败 vllm.patch" >&2; exit 1; }
   fi
-  md5sum "$HERE"/*.patch > "$SRC_DIR/.patches-applied"
-  echo "[start] 补丁已应用"
+  printf '%s\n' "$WANT_FP" > "$SRC_DIR/.patches-applied"
+  echo "[start] 补丁已应用（fingerprint ${WANT_FP:0:12}）"
 fi
 
 # 构建产物硬校验：worktree / 复制树缺了直接 ImportError，别等 9 min 后才发现
@@ -186,6 +222,9 @@ RUN_ARGS=(
   --additional-config "$ADDL_JSON"
   --speculative-config "$SPEC_JSON"
   --enable-prompt-tokens-details
+  "$@"     # 透传额外 vllm serve 参数，例如 KV offload：
+           #   bash start-server.sh \
+           #     --kv-transfer-config '{"kv_connector":"AscendStoreConnector",...}'
 )
 
 if [ "${DRY_RUN:-0}" = "1" ]; then

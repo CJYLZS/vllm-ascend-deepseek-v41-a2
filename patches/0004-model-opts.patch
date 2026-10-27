@@ -1,0 +1,336 @@
+diff --git a/vllm_ascend/models/deepseek_v41/engram/layer.py b/vllm_ascend/models/deepseek_v41/engram/layer.py
+index 1d8acdf4c..7712806ff 100644
+--- a/vllm_ascend/models/deepseek_v41/engram/layer.py
++++ b/vllm_ascend/models/deepseek_v41/engram/layer.py
+@@ -2,8 +2,15 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Engram projection and gate for BF16 and rotated Ascend checkpoints."""
+ 
++import os
++
+ import torch
+ from torch import nn
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    get_tp_group,
++)
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ 
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+@@ -11,6 +18,15 @@ from vllm_ascend.ops.triton.engram_gate import fused_engram_gate
+ 
+ from .common import engram_gate
+ 
++# [ENGRAM-WKV-TP] Ported from
++# deepseek-v4.1-flash-ascend910B:patches/files/model.py (`V41_ENGRAM_WKV_TP`).
++# The gate projection is [25600, 6144] bf16 = 314.6 MB, and every rank used to
++# hold a full replica. Sharding it along the output dimension keeps each output
++# element produced by exactly one matmul (same arithmetic, not a different
++# reduction order) and frees ~275 MB per rank for KV blocks. The result is
++# all-gathered back to the full width before the gate consumes it.
++_ENGRAM_WKV_TP = os.environ.get("VLLM_ASCEND_V41_ENGRAM_WKV_TP", "0") == "1"
++
+ 
+ class AscendEngram(nn.Module):
+     """Consume rows prepared by the v1 runner in the checkpoint residual basis."""
+@@ -20,14 +36,30 @@ class AscendEngram(nn.Module):
+         self.dim = config.hidden_size
+         self.hc_mult = config.hc_mult
+         self.eps = config.rms_norm_eps
+-        self.wkv = ReplicatedLinear(
+-            (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim,
+-            (self.hc_mult + 1) * self.dim,
+-            bias=False,
+-            quant_config=quant_config,
+-            prefix=f"{prefix}.wkv",
+-            return_bias=False,
+-        )
++        wkv_in = (config.engram_max_ngram_size - 1) * config.engram_n_heads * config.engram_head_dim
++        wkv_out = (self.hc_mult + 1) * self.dim
++        if _ENGRAM_WKV_TP:
++            tp_size = get_tensor_model_parallel_world_size()
++            assert wkv_out % tp_size == 0, f"engram wkv out {wkv_out} is not divisible by TP {tp_size}"
++            self._wkv_tp = tp_size
++            self._wkv_shard = wkv_out // tp_size
++            self._wkv_rank = get_tensor_model_parallel_rank()
++            # The checkpoint tensor is BF16 with no quantisation scales, so a
++            # plain Linear is enough; ReplicatedLinear would only add a TP-aware
++            # loader that we bypass (see the loader hook in model.py).
++            self.wkv = nn.Linear(wkv_in, self._wkv_shard, bias=False, dtype=torch.bfloat16)
++        else:
++            self._wkv_tp = 1
++            self._wkv_shard = wkv_out
++            self._wkv_rank = 0
++            self.wkv = ReplicatedLinear(
++                wkv_in,
++                wkv_out,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.wkv",
++                return_bias=False,
++            )
+         self.q_weight = nn.Parameter(torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16))
+         self.k_weight = nn.Parameter(torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16))
+ 
+@@ -39,6 +71,10 @@ class AscendEngram(nn.Module):
+         rotation: torch.Tensor | None,
+     ) -> torch.Tensor:
+         kv = self.wkv(rows)
++        if self._wkv_tp > 1:
++            # Output-dimension shard -> full width. Every element still comes
++            # from a single matmul, so this is bit-identical to the replica path.
++            kv = get_tp_group().all_gather(kv, dim=-1)
+         if (
+             rotation is None
+             and hidden_states.device.type == "npu"
+diff --git a/vllm_ascend/models/deepseek_v41/indexer.py b/vllm_ascend/models/deepseek_v41/indexer.py
+index 3f272c134..99d1f5fe6 100644
+--- a/vllm_ascend/models/deepseek_v41/indexer.py
++++ b/vllm_ascend/models/deepseek_v41/indexer.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """V4.1 index projections, quantized QLI and cross-layer candidate selection."""
+ 
++import os
++
+ import torch
+ import torch_npu
+ from torch import nn
+@@ -27,6 +29,18 @@ from vllm_ascend.worker.device_metadata import (
+     wait_for_device_metadata,
+ )
+ 
++# [QLI-NO-CAND] Ported from
++# deepseek-v4.1-flash-ascend910B:patches/files/indexer.py (`V41_QLI_NO_CANDIDATE`).
++# With the switch on, every layer runs the unfiltered position TopK (mode 3)
++# instead of the two-level candidate mechanism (mode 1 produces block ids,
++# mode 2 consumes them). The reference implementation measured the candidate
++# path as slower than a full scan and the resulting TopK as identical.
++#
++# NOTE: this port targets `npu_quant_lightning_indexer_v3`, while the reference
++# patch targets v2. The "identical TopK" claim is therefore NOT inherited; it
++# must be re-verified on v3 before the switch is enabled in a serving arm.
++_QLI_NO_CANDIDATE = os.environ.get("VLLM_ASCEND_V41_QLI_NO_CANDIDATE", "0") == "1"
++
+ 
+ class DeepseekV41Indexer(nn.Module):
+     """Small side attention that selects compressed KV positions.
+@@ -271,7 +285,15 @@ class DeepseekV41Indexer(nn.Module):
+         )
+         op_metadata = source_metadata.qli_metadata
+         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
+-        mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
++        if _QLI_NO_CANDIDATE:
++            # [QLI-NO-CAND] Every layer runs the unfiltered position TopK. The
++            # candidate bookkeeping is skipped entirely, so a source layer no
++            # longer writes blocks and a consumer no longer reads them.
++            mode = 3
++            uses_candidate_filter = False
++            is_candidate_source = False
++        else:
++            mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
+         selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v3(
+             quantized_query,
+             key,
+diff --git a/vllm_ascend/models/deepseek_v41/model.py b/vllm_ascend/models/deepseek_v41/model.py
+index 689ab3c59..10bfe954a 100644
+--- a/vllm_ascend/models/deepseek_v41/model.py
++++ b/vllm_ascend/models/deepseek_v41/model.py
+@@ -11,6 +11,7 @@ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any
+ 
++import os
+ import torch
+ import torch.nn.functional as F
+ import vllm.envs as envs
+@@ -95,6 +96,10 @@ from .engram.layer import AscendEngram
+ from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
+ from .indexer import DeepseekV41Indexer
+ 
++# [ENGRAM-WKV-TP] Mirrors models/deepseek_v41/engram/layer.py: the gate
++# projection is sharded along its output dimension instead of replicated.
++_ENGRAM_WKV_TP = os.environ.get("VLLM_ASCEND_V41_ENGRAM_WKV_TP", "0") == "1"
++
+ 
+ def _engram_enabled_for_runtime(config, vllm_config) -> bool:
+     """Use the current vLLM Engram opt-in for both runtime paths."""
+@@ -1749,9 +1754,21 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         if not self.model.has_engram:
+             return self._load_model_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
+-        loaded = self._load_model_weights((name, tensor) for name, tensor in weights if self._is_milestone_weight(name))
++        # [ENGRAM-WKV-TP] The gate projection is sharded along its output
++        # dimension, so each rank takes its own row block of the checkpoint
++        # tensor. Slicing here keeps the plain nn.Linear loader untouched.
++        loaded = self._load_model_weights(self._shard_engram_wkv(name, tensor) for name, tensor in weights if self._is_milestone_weight(name))
+         return loaded
+ 
++    @staticmethod
++    def _shard_engram_wkv(name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
++        """Take this rank's output-dimension rows of an Engram `wkv` weight."""
++        if not _ENGRAM_WKV_TP or not name.endswith(".engram.wkv.weight"):
++            return name, tensor
++        shard = tensor.shape[0] // get_tensor_model_parallel_world_size()
++        rank = get_tensor_model_parallel_rank()
++        return name, tensor[rank * shard : (rank + 1) * shard].contiguous()
++
+     def set_moe_parameters(self):
+         self.expert_weights = []
+ 
+diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+index 22fc9633b..9238f8d6b 100644
+--- a/vllm_ascend/ops/fused_moe/token_dispatcher.py
++++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+@@ -20,6 +20,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import os
+ from abc import ABC, abstractmethod
+ from typing import Generic
+ 
+@@ -52,6 +53,85 @@ from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_se
+ from vllm_ascend.quantization.quant_type import QuantType
+ from vllm_ascend.utils import should_skip_allreduce_across_dp_group
+ 
++# [MOE-MASK-RANGE] begin ------------------------------------------------------
++# Ported from deepseek-v4.1-flash-ascend910B:patches/files/token_dispatcher_moemask.py
++# (`V41_MOE_MASK_RANGE`, opt-in, default off = upstream behaviour).
++#
++# When the expert map is the standard linear EP placement -- the local experts
++# form one contiguous range and every other id maps to -1 -- the mask
++# `expert_map[topk_ids] != -1` is equivalent to a range compare, which drops the
++# aclnnIndex + IndexCheck pair per layer. The mask itself must stay: the -1 rows
++# of `expanded_row_idx` make unpermute read unwritten rows, and the zeroed
++# weight is what suppresses them.
++#
++# [SAFE-L1] The compare uses int32 0-dim tensors rather than Python ints: a
++# Python scalar makes LtScalar/GeScalar cast int32 topk_ids up to int64 first
++# (2 Cast per layer, measured 80/step at 40 layers). int32 -> int32 is identity
++# equivalent here because topk_ids, first and last all live in [0, E). Both
++# tensors are built once during the eager warm-up and reused at capture.
++_MOE_MASK_RANGE_FAST = os.environ.get("VLLM_ASCEND_V41_MOE_MASK_RANGE", "0") == "1"
++_MOE_MASK_RANGE_CACHE: dict = {}
++_MOE_MASK_RANGE_I32: dict = {}
++
++
++def _eplb_is_off() -> bool:
++    """EPLB (dynamic or forced) reshuffles expert_map, so the range form is invalid."""
++    try:
++        eplb = getattr(get_ascend_config(), "eplb_config", None)
++        if eplb is None:
++            return True
++        for _name in ("dynamic_eplb", "enable_eplb"):
++            if bool(getattr(eplb, _name, False)):
++                return False
++        return True
++    except Exception:
++        return False
++
++
++def _expert_map_is_contiguous_range(expert_map, first_expert_idx: int, last_expert_idx: int) -> bool:
++    """One-time content check: is expert_map exactly [first, last) -> 0..n-1, rest -1?"""
++    try:
++        _m = expert_map.detach().to("cpu", torch.int32).reshape(-1)
++        if _m.numel() < int(last_expert_idx):
++            return False
++        _expect = torch.full_like(_m, -1)
++        _expect[first_expert_idx:last_expert_idx] = torch.arange(
++            last_expert_idx - first_expert_idx, dtype=torch.int32
++        )
++        return bool(torch.equal(_m, _expect))
++    except Exception:
++        return False
++
++
++def _is_contiguous_local_range(expert_map, first_expert_idx: int, last_expert_idx: int) -> bool:
++    """Hot-path entry: EPLB off plus a cached (first, last, E)-scoped layout check.
++
++    The expert map layout is a property of the (rank, EP/EPLB config) pair, so
++    every layer under one config sees the same (first, last, E) and the same
++    layout. Checking once keeps this off the per-step path entirely.
++    """
++    if not _eplb_is_off():
++        return False
++    _key = (int(first_expert_idx), int(last_expert_idx), int(expert_map.numel()))
++    _cached = _MOE_MASK_RANGE_CACHE.get(_key)
++    if _cached is not None:
++        return _cached
++    _ok = _expert_map_is_contiguous_range(expert_map, first_expert_idx, last_expert_idx)
++    _MOE_MASK_RANGE_CACHE[_key] = _ok
++    return _ok
++
++
++def _i32_scalar(value: int, device) -> torch.Tensor:
++    key = (int(value), str(device))
++    t = _MOE_MASK_RANGE_I32.get(key)
++    if t is None:
++        t = torch.tensor(int(value), dtype=torch.int32, device=device)
++        _MOE_MASK_RANGE_I32[key] = t
++    return t
++
++
++# [MOE-MASK-RANGE] end --------------------------------------------------------
++
+ EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
+ EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+ 
+@@ -391,10 +471,20 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+         if expert_map is not None:
+             global_num_experts = len(expert_map) + global_redundant_expert_num
+-            mask = expert_map[topk_ids] != -1
+-            topk_weights = topk_weights * mask
+             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
+             last_expert_idx = first_expert_idx + self.num_experts_local
++            if _MOE_MASK_RANGE_FAST and _is_contiguous_local_range(
++                expert_map, first_expert_idx, last_expert_idx
++            ):
++                # [MOE-MASK-RANGE][SAFE-L1] Range compare in the int32 domain.
++                topk_weights = topk_weights.masked_fill(
++                    (topk_ids < _i32_scalar(first_expert_idx, topk_ids.device))
++                    | (topk_ids >= _i32_scalar(last_expert_idx, topk_ids.device)),
++                    0.0,
++                )
++            else:
++                mask = expert_map[topk_ids] != -1
++                topk_weights = topk_weights * mask
+         else:
+             first_expert_idx = 0
+             last_expert_idx = self.num_experts_local
+diff --git a/vllm_ascend/ops/rope_dsv4.py b/vllm_ascend/ops/rope_dsv4.py
+index fc213ad5d..00e525bb6 100644
+--- a/vllm_ascend/ops/rope_dsv4.py
++++ b/vllm_ascend/ops/rope_dsv4.py
+@@ -9,6 +9,8 @@ import torch_npu
+ from vllm.config import VllmConfig
+ from vllm.platforms import current_platform
+ 
++from vllm_ascend import envs
++
+ 
+ class RopeGlobalState:
+     def __init__(self):
+@@ -155,6 +157,19 @@ def get_cos_and_sin_dsa(
+                 buf_cos, buf_sin = group_buffers
+                 num_tokens = pos_tensor.size(0)
+ 
++                if envs.VLLM_ASCEND_ROPE_INDEX_SELECT and pos_tensor.ndim == 1:
++                    # Experimental: avoid expanding one row index per rotary
++                    # element. Keep writes in the same resident graph buffers,
++                    # including each independent speculative draft slot.
++                    indices = pos_tensor.to(torch.long)
++                    target_cos = buf_cos if draft_index is None else buf_cos[draft_index - 1]
++                    target_sin = buf_sin if draft_index is None else buf_sin[draft_index - 1]
++                    out_cos, out_sin = target_cos[:num_tokens], target_sin[:num_tokens]
++                    torch.index_select(full_rope_cos, 0, indices, out=out_cos)
++                    torch.index_select(full_rope_sin, 0, indices, out=out_sin)
++                    batch_result[config_key][group_name] = (out_cos, out_sin)
++                    continue
++
+                 # This is semantically equivalent to the previous
+                 # `full_rope_cos[pos_tensor] / full_rope_sin[pos_tensor]`
+                 # indexing followed by `copy_`; the change only combines the
+

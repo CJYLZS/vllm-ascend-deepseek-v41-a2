@@ -1,0 +1,54 @@
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -82,11 +82,50 @@
+     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
+     # Valid values: 0 or 1. This configuration is not sensitive.
+     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
++    # Experimental DSA RoPE cached lookup: index_select into resident buffers.
++    # Default: 0 (disabled); valid values: 0 or 1. Not sensitive.
++    # Requires review and NPU graph/accuracy/performance validation before use.
++    "VLLM_ASCEND_ROPE_INDEX_SELECT": lambda: _strict_binary_env("VLLM_ASCEND_ROPE_INDEX_SELECT"),
+     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
+     # 0 (default): auto-detect from device properties, falling back to 192 KB
+     # (safe for Ascend 910B/A3). Set to a positive value to override when
+     # auto-detection is unavailable or for debugging UB overflow issues.
+     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
++    # Build the V4.1 packed-cache slot mapping with the single-launch Triton
++    # kernel instead of the eager ~100-op chain. The kernel already exists
++    # upstream but is selected only for the A5 packed-cache backend; on A3 the
++    # eager chain runs once per KV cache group per step (~21 times per c=1
++    # decode step) on six tokens, and the device sits idle through most of it.
++    # Default 0 (upstream behaviour) so this stays an explicit A/B arm. Not
++    # sensitive.
++    "VLLM_ASCEND_V41_TRITON_SLOT_MAPPING": lambda: _strict_binary_env(
++        "VLLM_ASCEND_V41_TRITON_SLOT_MAPPING"
++    ),
++    # ---- Ported from deepseek-v4.1-flash-ascend910B -----------------------
++    # Every one of these is opt-in and default 0, so an unset switch keeps the
++    # upstream code path. Each is read once at import time by its module, which
++    # also means flipping it needs a restart -- and those code paths sit inside
++    # captured graphs, so a per-call flag could not take effect anyway.
++    #
++    # Replace `expert_map[topk_ids] != -1` with a contiguous-range compare when
++    # the expert map is a standard linear EP placement; the compare uses int32
++    # 0-dim tensors so aclnn does not cast topk_ids to int64 first. Not
++    # sensitive.
++    "VLLM_ASCEND_V41_MOE_MASK_RANGE": lambda: _strict_binary_env("VLLM_ASCEND_V41_MOE_MASK_RANGE"),
++    # Collapse the degenerate single-group `wo_a` transpose-batchmatmul into a
++    # plain 2D matmul. Numerically identical when n_local_groups == 1. Not
++    # sensitive.
++    "VLLM_ASCEND_V41_O_PROJ_2D": lambda: _strict_binary_env("VLLM_ASCEND_V41_O_PROJ_2D"),
++    # Run the unfiltered position TopK (mode 3) on every indexer layer instead of
++    # the two-level candidate mechanism. The reference repo verified an
++    # identical TopK on `npu_quant_lightning_indexer_v2`; this tree calls v3, so
++    # that equivalence must be re-verified before enabling. Not sensitive.
++    "VLLM_ASCEND_V41_QLI_NO_CANDIDATE": lambda: _strict_binary_env("VLLM_ASCEND_V41_QLI_NO_CANDIDATE"),
++    # Shard the Engram gate `wkv` projection across TP ranks along the output
++    # dimension and all-gather the result, instead of replicating the 314.6 MB
++    # weight on every rank. Same per-element arithmetic, lower HBM footprint.
++    # Not sensitive.
++    "VLLM_ASCEND_V41_ENGRAM_WKV_TP": lambda: _strict_binary_env("VLLM_ASCEND_V41_ENGRAM_WKV_TP"),
+ }
+ 
+ # end-env-vars-definition
