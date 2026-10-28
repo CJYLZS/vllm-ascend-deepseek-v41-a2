@@ -42,17 +42,11 @@ LOG_DIR="${LOG_DIR:-$HERE/runtime/$(hostname -s)/$NAME}"
 IMAGE="$IMAGE"; export IMAGE MODEL
 
 # ---- KV 外部池（可选；KV_OFFLOAD=1 才启用）--------------------------------
+# 实现不在本文件，在 kv_offload.sh —— 与工作区根目录 start-server.sh 共用同一份，
+# 免得像 GPU_UTIL 那回一样两处各写一遍再漂移。变量默认值也都在那里。
 # 关掉时脚本行为与从前逐字一致：不建容器、不写 conf、不加任何 vllm 参数。
-KV_OFFLOAD="${KV_OFFLOAD:-0}"             # 1 = 挂 AscendStoreConnector + memcache
-KV_DRAM_GB="${KV_DRAM_GB:-2}"             # ★ 每 rank 的 DRAM 池，不是整机
-KV_PROTOCOL="${KV_PROTOCOL:-host_shm}"    # 见下方注释，别改
-KV_WORLD_SIZE="${KV_WORLD_SIZE:-256}"     # 可登记的总 rank 上限，改了要重启 meta
-KV_META_NAME="${KV_META_NAME:-${NAME}-mmc-meta}"
-KV_META_PORT="${KV_META_PORT:-5100}"
-KV_STORE_PORT="${KV_STORE_PORT:-6100}"
-KV_METRICS_PORT="${KV_METRICS_PORT:-8100}"   # 不能是 8000，会和 vllm 端口撞
-KV_CONF_DIR="${KV_CONF_DIR:-$LOG_DIR/kv}"
-KV_CONF_IN_CT="${KV_CONF_IN_CT:-/workspace/kvconf}"
+KV_CONF_DIR="${KV_CONF_DIR:-$LOG_DIR/kv}"   # 实例级 conf 目录，交给 kv_offload.sh
+source "$HERE/kv_offload.sh"
 
 # decode 桶表：上游 27 桶 + 补 7 个 6N（draft 一步吃 num_reqs×(1+SPEC_TOKENS) 个 token，
 # 缺 6N 时 ACL graph 补位会把 draft 打回 eager，实测每输出时延 +26%）。
@@ -215,117 +209,12 @@ if [ -n "$PGO_SO" ]; then
   echo "[start] pgo=1 $(md5sum "$PGO_SO" | cut -c1-12)"
 fi
 
-# ---- KV 外部池（KV_OFFLOAD=1 才启用）-------------------------------------
-# 三件事缺一不可，缺任何一件 vllm 都会在 engine 初始化时 assert 死：
-#   ① MetaService 容器（5100/6100/8100，不占卡）
-#   ② 一份 mmc-local.conf，路径经 MMC_LOCAL_CONFIG_PATH 传给引擎
-#   ③ --kv-transfer-config '{"kv_connector":"AscendStoreConnector",...}'
-#
-# 配置里几个**实测踩过的**坑，写死在下面的模板里：
-#   · protocol 必须 host_shm
-#       host_rdma 的 extend 库在镜像是 0 字节（LoadExtendLibrary failed: -6）；
-#       device_rdma 单 rank 能过、8 rank 必 segfault（RaSocketBatchConnect）。
-#   · dram.size 是**每 rank**，8 卡要 ×8 内存。默认 2GB/rank ⇒ 整机 16GB。
-#       A3 要求对齐 1GB，host_shm 对齐 2MB，2GB 两边都满足。
-#   · metrics_url 不能是 8000，会跟 vllm 的 --port 撞；用 8100。
-#   · 不要用 docker run -e LD_LIBRARY_PATH 指 memfabric，会覆盖 CANN 路径
-#       ⇒ ImportError: libhccl.so。
-KV_MOUNTS=()
-KV_ENVS=()
-KV_ARGS=()
-if [ "$KV_OFFLOAD" = "1" ]; then
-  mkdir -p "$KV_CONF_DIR"
-  cat > "$KV_CONF_DIR/mmc-local.conf" <<EOF
-ock.mmc.meta_service_url = tcp://127.0.0.1:${KV_META_PORT}
-ock.mmc.local_service.config_store_url = tcp://127.0.0.1:${KV_STORE_PORT}
-ock.mmc.log_level = info
-ock.mmc.local_service.world_size = ${KV_WORLD_SIZE}
-ock.mmc.local_service.protocol = ${KV_PROTOCOL}
-ock.mmc.local_service.dram.size = ${KV_DRAM_GB}GB
-EOF
-  cat > "$KV_CONF_DIR/mmc-meta.conf" <<EOF
-ock.mmc.meta_service_url = tcp://127.0.0.1:${KV_META_PORT}
-ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:${KV_STORE_PORT}
-ock.mmc.meta_service.metrics_url = http://127.0.0.1:${KV_METRICS_PORT}
-ock.mmc.log_level = info
-EOF
-  echo "[start] kv_offload=1 protocol=$KV_PROTOCOL dram=${KV_DRAM_GB}GB/rank (整机 $((KV_DRAM_GB * TP))GB)"
-  echo "[start]           conf=$KV_CONF_DIR/mmc-local.conf"
-
-  KV_ENVS=(-e MMC_LOCAL_CONFIG_PATH="$KV_CONF_IN_CT/mmc-local.conf")
-  KV_MOUNTS=(-v "$KV_CONF_DIR:$KV_CONF_IN_CT:ro")
-  KV_ARGS=(--kv-transfer-config
-    "{\"kv_connector\":\"AscendStoreConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"backend\":\"memcache\"}}")
-
-  # MetaService 必须**先于** vllm 起，且比它活得久。已在跑就复用（不重启，
-  # 重启会丢掉所有已登记的 rank 与池内容）。
-  if [ "$(docker inspect -f '{{.State.Running}}' "$KV_META_NAME" 2>/dev/null || true)" = "true" ]; then
-    # 复用前必须确认它监听的端口和我们刚写的 local conf 一致，否则引擎会连到
-    # 一个不存在的端口 —— 那种失败发生在起服 8 分钟后，代价很大。
-    # 配置路径可能在 .Config.Env，也可能写在 bash -c 的字符串里（手工起的容器
-    # 就是后者），所以先两处都找，找不到就退化成"端口在听"这个弱判据。
-    meta_conf=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$KV_META_NAME" 2>/dev/null \
-                | sed -n 's/^MMC_META_CONFIG_PATH=//p' | head -1)
-    [ -n "$meta_conf" ] || meta_conf=$(docker inspect -f '{{join .Config.Cmd " "}}' "$KV_META_NAME" 2>/dev/null \
-                | tr ' ' '\n' | sed -n 's/^MMC_META_CONFIG_PATH=//p' | head -1)
-    meta_ports=""
-    if [ -n "$meta_conf" ]; then
-      meta_ports=$(docker exec "$KV_META_NAME" cat "$meta_conf" 2>/dev/null \
-                   | sed -n 's/.*tcp:\/\/127\.0\.0\.1:\([0-9]*\).*/\1/p;s#.*metrics_url.*:\([0-9]*\).*#\1#p' \
-                   | sort -u | paste -sd, -)
-    fi
-    if [ -z "$meta_ports" ]; then
-      # 弱判据：本次要用的三个端口必须都在听，否则一定连不上。
-      miss=""
-      for p in "$KV_META_PORT" "$KV_STORE_PORT" "$KV_METRICS_PORT"; do
-        ss -ltn 2>/dev/null | grep -q ":$p " || miss="$miss $p"
-      done
-      if [ -n "$miss" ]; then
-        echo "FATAL: 复用的 meta 容器 $KV_META_NAME 上这些端口没在听:$miss" >&2
-        echo "       它启动时用的端口可能与本次不同。二选一：" >&2
-        echo "       ① 改 KV_META_NAME 另起一个；② docker rm -f $KV_META_NAME 后重跑" >&2
-        exit 6
-      fi
-      echo "[start] meta 容器 $KV_META_NAME 在运行，端口 $KV_META_PORT/$KV_STORE_PORT/$KV_METRICS_PORT 均在听，复用"
-    else
-      want_ports=$(printf '%s\n%s\n%s\n' "$KV_META_PORT" "$KV_STORE_PORT" "$KV_METRICS_PORT" | sort -u | paste -sd, -)
-      if [ "$meta_ports" != "$want_ports" ]; then
-        echo "FATAL: 已存在的 meta 容器 $KV_META_NAME 端口是 [$meta_ports]，本次要 [$want_ports]" >&2
-        echo "       复用它会导致引擎连不上。二选一：" >&2
-        echo "       ① 改 KV_META_NAME 另起一个；② docker rm -f $KV_META_NAME 后重跑" >&2
-        exit 6
-      fi
-      echo "[start] meta 容器 $KV_META_NAME 已在运行且端口匹配 [$meta_ports]，复用"
-    fi
-  elif [ "${DRY_RUN:-0}" = "1" ]; then
-    echo "[start] DRY_RUN：将启动 meta 容器 $KV_META_NAME（$KV_META_PORT/$KV_STORE_PORT/$KV_METRICS_PORT）"
-  else
-    docker rm -f "$KV_META_NAME" >/dev/null 2>&1 || true
-    echo "[start] 启动 meta 容器 $KV_META_NAME"
-    docker run -d --name "$KV_META_NAME" --network host --restart unless-stopped \
-      -e MMC_META_CONFIG_PATH="$KV_CONF_IN_CT/mmc-meta.conf" \
-      -v "$KV_CONF_DIR:$KV_CONF_IN_CT:ro" \
-      --entrypoint bash "$IMAGE" -c \
-      'exec python -c "from memcache_hybrid import MetaService; MetaService.main()"' >/dev/null
-  fi
-
-  if [ "${DRY_RUN:-0}" != "1" ]; then
-    # 等 meta 的 metrics 端口起来。起来不了就别浪费 9 分钟去起 vllm。
-    kv_ready=0
-    for _ in $(seq 1 60); do
-      if curl -sf --max-time 2 "http://127.0.0.1:${KV_METRICS_PORT}/metrics" >/dev/null 2>&1; then
-        kv_ready=1; break
-      fi
-      sleep 1
-    done
-    if [ "$kv_ready" != "1" ]; then
-      echo "FATAL: meta 容器 60s 内未就绪（metrics :$KV_METRICS_PORT 不通）" >&2
-      echo "       看：docker logs --tail 40 $KV_META_NAME" >&2
-      exit 6
-    fi
-    echo "[start] meta 就绪 :$KV_META_PORT/:$KV_STORE_PORT/:$KV_METRICS_PORT"
-  fi
-fi
+# ---- KV 外部池（KV_OFFLOAD=1 才启用；实现在 kv_offload.sh）----------------
+# 两件事：① 按挂载树校验 0101（正确性闸门，理由见 kv_offload.sh 里的注释）；
+# ② 写 conf + 起/复用 MetaService，填出 KV_ENVS/KV_MOUNTS/KV_ARGS 三个数组。
+kv_offload_require_tree_fix "$SRC_DIR/vllm-ascend"
+kv_offload_setup
+export KV_OFFLOAD
 
 read -r -a PASSTHRU_ENVS <<< "$PASSTHRU_ENVS_STR"
 
