@@ -271,10 +271,14 @@ if [ "$need_prepare" = "1" ]; then
   fi
   # 第 1 行 = 序列+镜像指纹（决定"该不该重建"）
   # 第 2 行 = 建好那一刻的 git 状态指纹（决定"建好之后有没有被动过"）
+  # 第 3 行 = 建树用的镜像 Id（**明文**）：别的入口（工作区根 start-server.sh）要判断
+  #          "这棵树是不是用本次要挂的镜像建的"。指纹第 1 行是哈希，外部拿不到镜像
+  #          身份、只能自己再算一遍 —— 那就会像 GPU_UTIL 那回一样两处各写一遍再漂移。
   # 两行都要，只有第 1 行就发现不了"补丁没变但树被手改/混进残留"。
   {
     printf '%s\n' "$WANT_FP"
     tree_state_fingerprint
+    printf '%s\n' "$(image_identity)"
   } > "$SRC_DIR/.patches-applied"
   echo "[start] 补丁已应用（fingerprint ${WANT_FP:0:12}，树状态 $(tree_state_fingerprint | cut -c1-12)）"
 fi
