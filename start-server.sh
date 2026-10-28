@@ -125,14 +125,23 @@ fi
 # 为什么要这一步：v25 的改动全在 Python 侧，但运行必需的 .so（C 扩展、CANN 算子、
 # rust parser）在镜像里、且被 .gitignore 排除 ⇒ 打补丁的树必须**基于镜像自带的树**
 # 才配对。从镜像里 tar 出来（排除编译中间产物）再 apply，大小约 0.6 GB。
-# 序列指纹：series.conf + 每个 patch 的内容哈希。
-# 旧实现只看 .patches-applied **文件是否存在**，改了补丁却不重建树 ⇒ 静默用旧树。
+# 序列指纹 = 基础镜像身份 + series.conf + 每个 patch 的内容哈希。
+#
+# ★ 镜像身份必须进指纹。镜像自带的树是"补丁的基版"，换镜像却不重建树 =
+#   拿 0.30.0rc2 的代码去跑 0.31.0rc1（静默跑旧码）。旧实现只哈希 series.conf
+#   与补丁，换 IMAGE 后指纹不变 ⇒ 静默复用旧树。
+# 旧实现还只看 .patches-applied **文件是否存在**，改了补丁却不重建树 ⇒ 静默用旧树。
 # 真实事故：v2 把补丁从 1788 行裁到 796 行，tree/ 里仍是 v1 的改动（941 行），
-# 脚本照用不误。现在改为内容一致才跳过。
+# 脚本照用不误。
+image_identity() {
+  docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo "UNKNOWN-IMAGE"
+}
+
 series_fingerprint() {
   local list
   list=$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e '/^$/d' "$HERE/series.conf")
   {
+    printf 'image=%s\n' "$(image_identity)"
     printf '%s\n' "$list"
     local f
     for f in $list; do
@@ -146,13 +155,93 @@ series_fingerprint() {
   } | md5sum | cut -d' ' -f1
 }
 
+# 树的**实际**状态指纹：两棵树都是 git 仓库，让 git 算内容哈希。
+# 比逐文件 md5 更准（能区分 改/新增/删除）也更省（0.35 s vs 3.8 s / 17.8k 文件）。
+# 镜像里的树是 pristine（status 为空），所以打补丁后 status 恰好等于"补丁触及
+# 的文件集"；任何**额外**的条目都说明树被手改过或带了残留。
+# 真实事故：tree 里有 tests/ut/attention/test_dsa_v41_metadata_reuse.py，
+# 镜像没有、任何补丁都不带，却静静躺在树里（?? 行）两个月没人发现。
+tree_state_fingerprint() {
+  local d
+  for d in "$SRC_DIR/vllm-ascend" "$SRC_DIR/vllm"; do
+    printf '== %s\n' "${d/#$SRC_DIR/}"      # 只留相对名，SRC_DIR 变了不算树变了
+    if [ -e "$d/.git" ]; then
+      git -C "$d" status --porcelain 2>/dev/null || echo "GIT-ERROR"
+      # ⚠ 必须连**内容**一起哈希，不能只看 status：status 只说"哪个文件被改了"，
+      #   不说"改成了什么"。补丁本来就改了那 9 个文件，再改一次它们的内容，
+      #   status 一个字都不变（实测：改 dsa_v41.py 后 status 指纹仍为 90f94c51）。
+      git -C "$d" diff 2>/dev/null || echo "GIT-DIFF-ERROR"
+    else
+      echo "NO-GIT"
+    fi
+  done | md5sum | cut -d' ' -f1
+}
+
 WANT_FP=$(series_fingerprint)
 # 注意：脚本是 set -euo pipefail。`cat missing | head` 在 pipefail 下返回非 0
 # 会让赋值失败并静默退出，所以用 `|| true` 兜住"标记文件不存在"这个正常情况。
-HAVE_FP=$(head -1 "$SRC_DIR/.patches-applied" 2>/dev/null || true)
+HAVE_FP=$(sed -n '1p' "$SRC_DIR/.patches-applied" 2>/dev/null || true)
+HAVE_STATE=$(sed -n '2p' "$SRC_DIR/.patches-applied" 2>/dev/null || true)
 
-if [ "${SKIP_PREPARE:-0}" != "1" ] && [ "$WANT_FP" != "$HAVE_FP" ]; then
-  echo "[start] 准备源码树 -> $SRC_DIR（首次约 1 min，约 0.6 GB）"
+# 要么补丁/镜像变了（指纹不同），要么树的内容与"刚建好时"不一致（被手改/有残留）。
+need_prepare=0
+prepare_why=""
+if [ "$WANT_FP" != "$HAVE_FP" ]; then
+  need_prepare=1; prepare_why="补丁序列或基础镜像变了（期望 ${WANT_FP:0:12}，树上是 ${HAVE_FP:0:12}）"
+elif [ -z "$HAVE_STATE" ]; then
+  need_prepare=1; prepare_why="树里没有状态指纹（旧版本建的树，无法确认内容）"
+else
+  actual_state=$(tree_state_fingerprint)
+  if [ "$actual_state" != "$HAVE_STATE" ]; then
+    need_prepare=1
+    prepare_why="树的内容与刚建好时不一致（被改过，或混进了不该有的文件）"
+  fi
+fi
+
+if [ "${SKIP_PREPARE:-0}" = "1" ] && [ "$need_prepare" = "1" ]; then
+  echo "[start] SKIP_PREPARE=1：跳过重建，但树的状态不对 —— $prepare_why" >&2
+  echo "[start]   （你在手工调树的话这正是预期；否则去掉 SKIP_PREPARE 让它重建）" >&2
+  need_prepare=0
+fi
+
+# ★ DRY_RUN 必须在**任何副作用之前**生效。这个脚本的 DRY_RUN 原本只拦截最后的
+#   docker run，前面的 rm -rf / tar 解包 / 打补丁照样执行 —— 2026-10-28 实测把
+#   tree/vllm-ascend 清空了（rm 因容器占着 .nfs* 文件而报错，其余全删掉）。
+#   教训：凡是"只打印"的开关，必须在第一个写操作之前生效，不能只拦最后一步。
+#   这里不直接退出 —— DRY_RUN 的用途就是预览 docker 命令，跳过后面的树相关校验
+#   （DRY_RUN_SKIP_TREE=1）照样把它打印出来。
+DRY_RUN_SKIP_TREE=0
+if [ "${DRY_RUN:-0}" = "1" ] && [ "$need_prepare" = "1" ]; then
+  echo "[start] DRY_RUN=1：树需要重建 —— $prepare_why" >&2
+  echo "[start]   DRY_RUN 不动磁盘，跳过重建与树相关校验；下面打印的命令基于当前树。" >&2
+  need_prepare=0
+  DRY_RUN_SKIP_TREE=1
+fi
+
+if [ "$need_prepare" = "1" ]; then
+  if [ -n "$HAVE_FP" ]; then
+    echo "[start] 重建源码树 —— $prepare_why"
+    echo "[start]   旧树里若有手改内容会被覆盖（tree/ 是产物，不是工作区）"
+  else
+    echo "[start] 准备源码树 -> $SRC_DIR（首次约 1 min，约 0.6 GB）"
+  fi
+  # 重建前必须清空两个子树：tar 解包是**覆盖**，不会删除旧树里多出来的文件。
+  # 实测残留就是这么来的：tree 里曾有 tests/ut/attention/test_dsa_v41_metadata_reuse.py
+  # （镜像没有、任何补丁都不带），一路跟着每次"重建"活了下来。
+  # 删除前确认目标确实在 SRC_DIR 之下，且 SRC_DIR 是绝对路径且不像 / 。
+  case "$SRC_DIR" in
+    /|/mnt|/mnt/nfs|/mnt/nfs/services) echo "FATAL: 拒绝在 $SRC_DIR 下删树，SRC_DIR 太浅" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "FATAL: SRC_DIR=$SRC_DIR 必须是绝对路径（重建要删旧树）" >&2; exit 2 ;;
+  esac
+  for sub in vllm-ascend vllm; do
+    target="$SRC_DIR/$sub"
+    case "$target" in
+      "$SRC_DIR"/*) ;;
+      *) echo "FATAL: 拒绝删除 $target（不在 $SRC_DIR 之下）" >&2; exit 2 ;;
+    esac
+    [ -e "$target" ] && { echo "[start]   清空旧 $sub"; rm -rf -- "$target"; }
+  done
   mkdir -p "$SRC_DIR/vllm-ascend" "$SRC_DIR/vllm"
   docker run --rm --entrypoint tar "$IMAGE" -C /vllm-workspace -cf - \
       --exclude='vllm-ascend/csrc/build' --exclude='vllm-ascend/csrc/build_cache' \
@@ -180,11 +269,19 @@ if [ "${SKIP_PREPARE:-0}" != "1" ] && [ "$WANT_FP" != "$HAVE_FP" ]; then
   else
     patch -p1 -d "$SRC_DIR/vllm" < "$HERE/vllm.patch" || { echo "FATAL: patch 失败 vllm.patch" >&2; exit 1; }
   fi
-  printf '%s\n' "$WANT_FP" > "$SRC_DIR/.patches-applied"
-  echo "[start] 补丁已应用（fingerprint ${WANT_FP:0:12}）"
+  # 第 1 行 = 序列+镜像指纹（决定"该不该重建"）
+  # 第 2 行 = 建好那一刻的 git 状态指纹（决定"建好之后有没有被动过"）
+  # 两行都要，只有第 1 行就发现不了"补丁没变但树被手改/混进残留"。
+  {
+    printf '%s\n' "$WANT_FP"
+    tree_state_fingerprint
+  } > "$SRC_DIR/.patches-applied"
+  echo "[start] 补丁已应用（fingerprint ${WANT_FP:0:12}，树状态 $(tree_state_fingerprint | cut -c1-12)）"
 fi
 
 # 构建产物硬校验：worktree / 复制树缺了直接 ImportError，别等 9 min 后才发现
+# DRY_RUN 且树待重建时跳过（此时树还是旧的/空的，校验只会掩盖真正要打印的命令）
+if [ "${DRY_RUN_SKIP_TREE:-0}" != "1" ]; then
 for f in "$SRC_DIR/vllm-ascend/vllm_ascend/vllm_ascend_C.cpython-312-aarch64-linux-gnu.so" \
          "$SRC_DIR/vllm-ascend/vllm_ascend/libvllm_ascend_kernels.so" \
          "$SRC_DIR/vllm/vllm/_rust_tool_parser.abi3.so"; do
@@ -201,6 +298,7 @@ if [ -n "$missing" ]; then
   echo "       补丁没打成功？或 SRC_DIR 指向了未打补丁的树。" >&2
   exit 3
 fi
+fi   # DRY_RUN_SKIP_TREE
 
 PGO_MOUNTS=()
 if [ -n "$PGO_SO" ]; then
