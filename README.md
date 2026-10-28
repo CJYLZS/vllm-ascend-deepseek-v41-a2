@@ -175,7 +175,8 @@ PGO_SO=/path/to/libpython3.12.so.1.0 bash start-server.sh
 ## 6. 可选：KV 外部池（`KV_OFFLOAD=1`）
 
 把 KV 缓存卸载到主机 DRAM 池，跨请求复用。脚本会自动起 MetaService 容器、生成配置、
-加 `--kv-transfer-config`。
+加 `--kv-transfer-config`。实现在同目录 `kv_offload.sh`（工作区根目录那条起服入口
+也 source 它，所以两条入口的池行为完全一致）。
 
 ```bash
 KV_OFFLOAD=1 bash start-server.sh
@@ -188,6 +189,7 @@ KV_OFFLOAD=1 KV_DRAM_GB=4 bash start-server.sh     # 改池大小
 | `KV_PROTOCOL` | `host_shm` | 别改，见下 |
 | `KV_WORLD_SIZE` | 256 | 可登记 rank 上限，改了要重启 meta |
 | `KV_META_PORT` / `KV_STORE_PORT` / `KV_METRICS_PORT` | 5100 / 6100 / 8100 | metrics 不能是 8000，会和 `--port` 撞 |
+| `KV_ALLOW_UNFIXED_TREE` | 0 | 见下"源码树要求"，默认不许绕过 |
 
 MetaService 容器名 `<NAME>-mmc-meta`，不占卡。已存在时校验端口后复用（不重启，重启会丢池）。
 
@@ -196,6 +198,21 @@ MetaService 容器名 `<NAME>-mmc-meta`，不占卡。已存在时校验端口�
 1. `KV_PROTOCOL` 必须 `host_shm`。`host_rdma` 的 extend 库在镜像是 0 字节；
    `device_rdma` 单 rank 能过、**8 rank 必 segfault**。
 2. 不要给容器加 `-e LD_LIBRARY_PATH`。它会覆盖镜像的 CANN 路径 ⇒ `libhccl.so` 找不到。
+
+**源码树要求**：池依赖 `patches/0101`（MRV2 抢占恢复后清 `_preempted_req_ids`）。
+缺这 2 行时，抢占后的池 key 会关联到**错误的 block** —— 命中池就读到别人的 KV，
+输出错但日志不报错。所以 `KV_OFFLOAD=1` 会自动校验挂载树，缺修复直接 `exit 8`：
+
+```
+FATAL: KV_OFFLOAD=1 但源码树不含 KV 池的 MRV2 修复
+```
+
+本仓库的树由 `series.conf` 生成，天然含 0101。若把补丁固化进了别处（如
+`rc2/stable`）而那边漏了这 2 行，同样会被拦。真要不带修复跑：
+
+```bash
+KV_ALLOW_UNFIXED_TREE=1 KV_OFFLOAD=1 bash start-server.sh   # 会降级为警告
+```
 
 **确认真的生效**（`WAIT=1` 会自检；池是静默失效型，起得来不代表接上了）：
 
