@@ -8,30 +8,36 @@
 
 ## 实测数据
 
-单机 8 × 910B3（A2），TP8/EP8，reps=3，temperature=0。
+单机 8 × 910B3（A2），TP8/EP8，reps=3，temperature=0。测的是**默认档**
+（V2 runner + 6 个 gate + 共享专家多流 + PGO + `HCCL_OP_EXPANSION_MODE=AIV`，挂 2 GB/rank KV 外部池）。
 
 **8K prompt → 512 输出**：
 
 | 并发 | 1 | 4 | 5 | 8 | 9 | 13 |
 |---|---|---|---|---|---|---|
 | V1 每步 (ms) | 46.33 | 55.40 | 57.46 | 60.21 | 62.51 | 67.80 |
-| **V2 每步 (ms)** | **30.01** | **39.88** | **43.31** | **47.22** | **49.06** | **54.31** |
-| 每步降幅 | −35.2% | −28.0% | −24.6% | −21.6% | −21.5% | −19.9% |
-| V2 吞吐 (tok/s/流) | 109.9 | 72.5 | 64.1 | 58.8 | 57.6 | 49.0 |
+| **V2 每步 (ms)** | **28.05** | **36.87** | **38.89** | **42.00** | **44.60** | **50.63** |
+| 每步降幅 | −39.5% | −33.4% | −32.3% | −30.2% | −28.7% | −25.3% |
+| V2 吞吐 (tok/s/流) | 115.0 | 71.1 | 68.0 | 60.7 | 58.0 | 49.6 |
 
 **8K prompt → 1024 输出**（与上表是两套协议，不可混比），最大并发 16：
 
 | 并发 | 1 | 4 | 8 | 16 |
 |---|---|---|---|---|
-| 每步 (ms) | 29.99 | 40.01 | 47.73 | 57.56 |
-| 吞吐 (tok/s/流) | 143.3 | 77.3 | 59.0 | 52.0 |
-| 聚合吞吐 (tok/s) | 143.3 | 309.4 | 471.6 | 832.8 |
+| 每步 (ms) | 28.21 | 37.43 | 43.68 | 51.05 |
+| 吞吐 (tok/s/流) | 129.8 | 91.6 | 66.6 | 60.0 |
+| 聚合吞吐 (tok/s) | 129.8 | 366.2 | 532.7 | 959.5 |
 
-**KV 容量**：3,642,093 tokens（V1 是 3,633,276；开池 3,642,211）。
+**KV 容量**：3,629,044 tokens（V1 是 3,633,276）。
+
+> 与 AIV 前的同一配置相比少约 **12.3k token**（AIV 关的三次是 3,641,270 / 3,641,388 /
+> 3,641,388，可用 KV 15.60–15.61 GiB；AIV 开是 15.55 GiB）。这个差已远在容量噪声之外
+> （同配置重启只在 ±128 浮动），**最可能**是 AIV 额外占了一段 device workspace，
+> 但**没有单独做变量隔离**，只能算观察。容量还在 3.46x 并发上，不影响可用性。
 
 > 判断快慢只看每步时延（可复现到 0.3%）；吞吐受投机解码接受长度抽签影响，单发波动
-> ±15%，只作参考。V1 一行为同机同协议的历史基准，不同次启动，差距含「V2 runner」与
-> 「V2 用不上 6 个 dspark 开关」两个因素。
+> ±15%，只作参考。V1 一行为同机同协议的历史基准，不同次启动，差距含「V2 runner」
+> 「V2 用不上 6 个 dspark 开关」「无 AIV/多流/PGO」等因素。
 
 ## 1. 前置条件
 
@@ -148,7 +154,8 @@ vllm/vllm/_rust_tool_parser.abi3.so、vllm/vllm/vllm-rs
 | `SRC_MOUNT_MODE` | ro | 要改代码调试就设 `rw` |
 | `PGO_SO` | 空 | PGO 版 libpython，见 §5 |
 | `KV_OFFLOAD` | 0 | 挂 KV 外部池，见 §6 |
-| `MULTISTREAM_SHARED_EXPERT` | 1 | 共享专家多流。上游镜像自带、**无需补丁**；实测每步 −1.3~−4.6%（c=16 57.56 ms）。生效自证 = 日志 `shared_experts.py:180` 的 `Shared expert split computation validation passed`。与 fused MC2 互斥 |
+| `MULTISTREAM_SHARED_EXPERT` | 1 | 共享专家多流。上游镜像自带、**无需补丁**；实测每步 −1.3~−4.6%。生效自证 = 日志 `shared_experts.py:180` 的 `Shared expert split computation validation passed`。与 fused MC2 互斥 |
+| `PASSTHRU_ENVS_STR` | 6 gate + AIV | 覆盖它会**整串替换**，6 个 gate 和 `HCCL_OP_EXPANSION_MODE=AIV` 一起丢（静默）。只加东西时请在自己那份里把默认串抄全，见 §7 |
 
 `--enable-prompt-tokens-details` 已内置。上游默认关闭，导致 `usage.prompt_tokens_details`
 恒为 `null`，prefix cache 命中量在 API 里看不到。开启后返回
@@ -231,7 +238,7 @@ curl -s http://127.0.0.1:8100/metrics | grep '^memcache_total_capacity_bytes'   
 
 ---
 
-## 7. 6 个开关必须都传
+## 7. 6 个开关必须都传（外加 AIV）
 
 下面 6 个 env **默认值全是 0**，不传时服务照常起、日志不报错，但收益全丢：
 
@@ -245,6 +252,11 @@ VLLM_ASCEND_V41_ENGRAM_WKV_TP           engram wkv 按输出维分片（每卡�
 ```
 
 **全部在 import 期读取且在捕获图里 ⇒ 只能重启切换，热改 env 无效。**
+
+脚本默认还会多传一个 **`HCCL_OP_EXPANSION_MODE=AIV`**（不是 `VLLM_ASCEND_*` gate，不走
+`envs.py`，也不受 gate 定义校验管）。它把集合通信的展开/执行从 HOST 挪到 Vector Core，
+实测通信 **−42.3%**、每步 **−10.8%**，零代码。两个前提：**单机对称 8 卡**、**非确定性**
+（开了 `HCCL_DETERMINISTIC=true` 会被压掉）。回退就是把它从 `PASSTHRU_ENVS_STR` 里删掉。
 
 > 另有 `MULTISTREAM_SHARED_EXPERT`（§4）也是同类"静默失效"开关，但它走
 > `--additional-config`，不是 env，因此不在此表。
@@ -262,7 +274,16 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/health   # 期望
 
 # 2) 参数与 env 真的生效了
 docker inspect dsv41 --format '{{json .Config.Cmd}}' | tr ',' '\n' | grep -E 'speculative|enable-prompt'
-docker inspect dsv41 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep VLLM_ASCEND
+docker inspect dsv41 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'VLLM_ASCEND|HCCL_OP_EXPANSION_MODE'
+
+# 2b) AIV 真的生效了（唯一可信判据，不用重启就能拿）
+grep -rl 'aivMode\[1\]' \
+  runtime/$(hostname -s)/dsv41/logs/ascend_plog/log/run/plog/ | wc -l   # 期望 8
+#    完整自证行形如：
+#    [HCCL_ENV] environmental variable HCCL_OP_EXPANSION_MODE is [AIV],
+#               aicpuUnfold[0], aivMode[1], enableFfts[1], aicpuCacheEnable[0]
+#    8 个 rank 各一行（主进程/EngineCore 那两个 plog 里没有，正常）。
+#    全是 aivMode[0] 说明 env 没设上或被 HCCL_DETERMINISTIC 压掉。
 
 # 3) 确认走的是 V2（V1 的判据在 V2 下恒为 0，不能拿来用）
 docker logs dsv41 2>&1 | grep -c 'npu model runner v2 is in developing'   # 期望 8

@@ -31,7 +31,7 @@
 |---|---|
 | `README.md` | 部署指引 + 实测数据。**给用户看的**，别塞内部细节 |
 | `AGENTS.md` | 本文件。交接/协作说明、内部结构、踩坑记录 |
-| `start-server.sh` | 起服脚本，唯一的执行入口（474 行） |
+| `start-server.sh` | 起服脚本，唯一的执行入口（488 行） |
 | `series.conf` | 补丁序列声明，`start-server.sh` 按行读取并顺序 apply |
 | `patches/0*.patch` | vllm-ascend 侧性能/功能优化，**默认启用** |
 | `patches/1*.patch` | vllm-ascend 侧 KV offload 相关，只有挂 `--kv-transfer-config` 时需要 |
@@ -92,14 +92,14 @@ mock 依赖，或者按 `b27a32d` 提交里记录的方式，把它拷进 vllm-a
 
 ## 3. `start-server.sh` 结构
 
-474 行，关键段落（行号会随改动漂移，按注释标题搜）：
+488 行，关键段落（行号会随改动漂移，按注释标题搜）：
 
 | 段 | 内容 |
 |---|---|
 | `必填项` | `IMAGE`、`MODEL` 必须由环境变量传入 |
 | `可调项` | 24 个默认赋值（其中 ~11 个是用户常调的，见 README §4；其余是 KV 池细节） |
 | `KV 外部池` | `KV_OFFLOAD=1` 才启用，`KV_DRAM_GB` 是**每 rank**不是整机 |
-| `PASSTHRU_ENVS_STR` | 6 个 gate 的 `-e` 串。**改这里要同步改 §6 的说明** |
+| `PASSTHRU_ENVS_STR` | 6 个 gate 的 `-e` 串 **+ `HCCL_OP_EXPANSION_MODE=AIV`**（共 7 条）。前 6 条受 gate 定义校验，AIV 那条不受（校验只抓 `VLLM_ASCEND_*=1`）。**改这里要同步改 §6 的说明** |
 | `已有一个吃 8 卡的容器就别重复起` | 前置拦截 + `ALLOW_FOREIGN` 白名单 |
 | `源码树` | 序列指纹判据 + 从镜像 tar + 按 series apply + 构建产物校验 + gate 定义校验 |
 | `KV 外部池`（第二段） | MetaService 容器起/复用、生成配置、就绪闸门 |
@@ -137,6 +137,11 @@ VLLM_ASCEND_V41_ENGRAM_WKV_TP           engram wkv 按输出维分片（每卡�
 ```
 
 **全部在 import 期读取且在捕获图里 ⇒ 只能重启切换，热改 env 无效。**
+
+> 与这 6 个 gate **并列但不同类**的还有一条 `HCCL_OP_EXPANSION_MODE=AIV`（同样在
+> `PASSTHRU_ENVS_STR` 里、同样默认开、同样重启才生效）：它不在 `envs.py` 里、不需要任何
+> patch，改的是 HCCL 通信层。所以 `patches/` 与 `series.conf` 一行都没动，
+> 但**它是默认档的一部分** —— 复现实测数据时必须带上，否则会慢约 10%。
 
 V1 分支有 **12** 个，本文档对应的 V2 分支只留 **6** 个。另外 6 个
 `VLLM_ASCEND_DSPARK_*` 只在 `spec_decode/dspark_proposer.py` 与
@@ -184,9 +189,14 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 | 开关 | 状态 | 生效自证 |
 |---|---|---|
 | `MULTISTREAM_SHARED_EXPERT=1`（默认） | ✅ **已开**，每步 −1.3~−4.6% | `shared_experts.py:180` 的 `Shared expert split computation validation passed` |
+| **`HCCL_OP_EXPANSION_MODE=AIV`（默认）** | ✅ **已开**，通信 −42%、每步 −10.8% | plog `[HCCL_ENV] ... aivMode is [1]`（**8/8 rank**，默认 `HCCL_DEBUG_CONFIG=0x0` 就会打印） |
 | `enable_flashcomm1=true` | ❌ **已否决**，+8~+22% | 不要开：会砍掉非 TP 倍数的 capture size（32/24→24/20），且延迟受限下拆通信是净亏 |
 
-- 多流是**上游镜像自带的配置项**，不涉及本仓库任何 patch。
+- 多流是**上游镜像自带的配置项**，不涉及本仓库任何 patch；AIV 是 **HCCL 侧 env，同样零代码**，
+  但它不在 `envs.py` 里，也不走 `--additional-config`，而是和 6 个 gate 一起放在 `PASSTHRU_ENVS_STR`。
+- ⚠ **AIV 与 `HCCL_DETERMINISTIC=true` 冲突**（确定性优先会压掉 AIV），当前非确定性，别打开它。
+- ⚠ **AIV 会多吃一点 device workspace**：同一配置可用 KV 15.61 → 15.55 GiB、容量约 3.64M → 3.63M
+  token（单次观测，未做隔离变量；仍 3.46x 并发，不影响可用性）。
 - 加其它 `additional_config` 用 `ADDL_EXTRA='"k":v'`（`serve.sh` 会拼进 `ADDL_JSON`），
   先 `DRY_RUN=1` 验。`ADDL_EXTRA` 与 `MULTISTREAM_SHARED_EXPERT` 会自动合并。
 - ⚠ `SRC_ROOT` 默认 `patch`（挂 `tree/`）；要和挂 `src/` 的基线对照必须显式 `SRC_ROOT=src`。
@@ -214,6 +224,8 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 - [ ] 退出码语义别改（§3 那张表是本文档独有的，README 未列）
 - [ ] `WAIT=1` 的 V2 判据别退回 V1 判据 —— V1 的 `runtime_mode=FULL` /
       `[dspark-graph-capture]` 在 V2 下**恒为 0**，照抄会把成功判成失败
+- [ ] 动 `PASSTHRU_ENVS_STR` 时**保留 `HCCL_OP_EXPANSION_MODE=AIV`**。它是纯 `-e` 串、
+      不经过 gate 校验，删掉不会报任何错，只会让每步慢 10%（实测过）
 
 改 **README**：
 - [ ] 用户向内容放 README，内部结构/踩坑放本文档
@@ -240,6 +252,11 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 - Model Runner V2 在 vllm-ascend 侧标注 `[Experimental]`，官方 DeepSeek-V4 + dspark
   的 e2e 覆盖的是 **A3**，**A2 无官方覆盖**。
 - `SPEC_TOKENS` 只能是 `n_predict=5` 的整数倍，取 10 实测更差。
+- **AIV 的收益只在「A2 + 单机 8 卡 + 对称推理」上测过**（c=1/4/5/8/9/13/16 全档都测了）。
+  A3、多机、PD 分离都没测；官方文档还说 A2 的 AIV「不支持多通信域并行」——本机虽然
+  实测没触发（3 个 8-rank 域下全局开也正常），但别的拓扑别照抄这个结论。
+- **AIV 会让 KV 容量少约 12k token**（3.64M → 3.63M，可用 KV 15.61 → 15.55 GiB）。
+  只观测到一次，没做隔离变量；仍 3.46x 并发，不影响可用性。
 - 不要用 `vllm_ascend/_version.py` 判断实际跑的代码 —— 它由构建期生成，本补丁没
   重新生成，仍报 `0.30.0rc2` / `g8fde6d4e3`。要看真实状态用
   `git -C $SRC_DIR/vllm-ascend log --oneline -1`。

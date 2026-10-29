@@ -73,7 +73,21 @@ PASSTHRU_ENVS_STR="${PASSTHRU_ENVS_STR:-\
 -e VLLM_ASCEND_V41_MOE_MASK_RANGE=1 \
 -e VLLM_ASCEND_V41_O_PROJ_2D=1 \
 -e VLLM_ASCEND_V41_QLI_NO_CANDIDATE=1 \
--e VLLM_ASCEND_V41_ENGRAM_WKV_TP=1}"
+-e VLLM_ASCEND_V41_ENGRAM_WKV_TP=1 \
+-e HCCL_OP_EXPANSION_MODE=AIV}"
+
+# 最后一行的 HCCL_OP_EXPANSION_MODE=AIV 不是 VLLM_ASCEND_* gate，不受下面那道
+# "gate 必须在 envs.py 里有定义"的校验管（那道校验只抓 VLLM_ASCEND_..=1）。
+# 它改的是 HCCL 集合通信的展开/执行位置（HOST → Vector Core），实测把通信从
+# 10.394 降到 6.002 ms/步、每步 57.19 → 51.04 ms（−10.8%），零代码改动。
+#   ⚠ 与 HCCL_DETERMINISTIC=true 冲突（确定性优先会压掉 AIV），当前非确定性。
+#   ⚠ A2 官方文档说 AIV「不支持多通信域并行」，但本机实测 3 个 8-rank 域下
+#     全局开启起得来、跑得对、有收益 ⇒ 不需要按域设。
+#   ⚠ 回退：把这一行删掉即可。生效自证 = plog 里
+#     `[HCCL_ENV] ... aivMode is [1]`（8/8 rank）。
+#   ⚠ 会让 KV 容量少约 12k token（3.64M → 3.63M），仍 3.46x 并发，不影响可用。
+# 全档实测（8K→512 六档、8K→1K 四档）见 README「实测数据」，那两张表就是带着这
+# 一行测出来的 —— 删掉它就不再是 README 里那组数。
 
 for t in docker tar; do
   command -v "$t" >/dev/null 2>&1 || { echo "FATAL: 缺命令 $t" >&2; exit 1; }
