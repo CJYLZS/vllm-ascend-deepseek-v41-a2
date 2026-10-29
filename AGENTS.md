@@ -179,6 +179,18 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 - c=16 实测：设备空档 2.5 ms/步、被 host 覆盖的仅 0.29 ms ⇒ **host 侧已无可削空间**，
   且通信与计算**零重叠**（10 ms/步全在关键路径上）
 
+### 收益开关（2026-10-29 定）
+
+| 开关 | 状态 | 生效自证 |
+|---|---|---|
+| `MULTISTREAM_SHARED_EXPERT=1`（默认） | ✅ **已开**，每步 −1.3~−4.6% | `shared_experts.py:180` 的 `Shared expert split computation validation passed` |
+| `enable_flashcomm1=true` | ❌ **已否决**，+8~+22% | 不要开：会砍掉非 TP 倍数的 capture size（32/24→24/20），且延迟受限下拆通信是净亏 |
+
+- 多流是**上游镜像自带的配置项**，不涉及本仓库任何 patch。
+- 加其它 `additional_config` 用 `ADDL_EXTRA='"k":v'`（`serve.sh` 会拼进 `ADDL_JSON`），
+  先 `DRY_RUN=1` 验。`ADDL_EXTRA` 与 `MULTISTREAM_SHARED_EXPERT` 会自动合并。
+- ⚠ `SRC_ROOT` 默认 `patch`（挂 `tree/`）；要和挂 `src/` 的基线对照必须显式 `SRC_ROOT=src`。
+
 ### 历史事故（改脚本/补丁前值得知道）
 
 - **补丁静默用旧树**（`b27a32d`）：旧判据只看 `.patches-applied` 是否存在，

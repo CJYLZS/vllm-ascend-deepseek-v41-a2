@@ -36,6 +36,13 @@ MAX_SEQS="${MAX_SEQS:-32}"
 GPU_UTIL="${GPU_UTIL:-0.92}"
 BLOCK="${BLOCK:-128}"
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
+# shared expert 多流：1=开（默认，实测每步 −1.3~−4.6%），0=关。见下方 ADDL_JSON 注释。
+MULTISTREAM_SHARED_EXPERT="${MULTISTREAM_SHARED_EXPERT:-1}"
+case "$MULTISTREAM_SHARED_EXPERT" in
+  1|true|True)   MULTISTREAM_SHARED_EXPERT=true ;;
+  0|false|False) MULTISTREAM_SHARED_EXPERT=false ;;
+  *) echo "FATAL: MULTISTREAM_SHARED_EXPERT=$MULTISTREAM_SHARED_EXPERT（应为 0/1）" >&2; exit 2 ;;
+esac
 SRC_DIR="${SRC_DIR:-$HERE/tree}"          # 打补丁后的源码树放这里
 PGO_SO="${PGO_SO:-}"                      # 可选：PGO 版 libpython（见 README §5）
 LOG_DIR="${LOG_DIR:-$HERE/runtime/$(hostname -s)/$NAME}"
@@ -321,7 +328,12 @@ export KV_OFFLOAD
 read -r -a PASSTHRU_ENVS <<< "$PASSTHRU_ENVS_STR"
 
 COMPILATION_JSON="{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[${CUDAGRAPH_SIZES}]}"
-ADDL_JSON='{"enable_cpu_binding":true,"ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false}}'
+# shared expert 多流（MULTISTREAM_SHARED_EXPERT=1，默认开）：上游镜像自带实现
+# （shared_experts.py，commit e28308c15，在镜像基线 8fde6d4e3 祖先链上），
+# 我们只是打开配置项，不涉及任何补丁。实测 8K→1K 四档每步时延 −1.3~−4.6%，
+# 生效自证 = 日志 `shared_experts.py:180` 的 "Shared expert split computation
+# validation passed"。回退：MULTISTREAM_SHARED_EXPERT=0。
+ADDL_JSON='{"enable_cpu_binding":true,"ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":'"${MULTISTREAM_SHARED_EXPERT:-1}"'}'
 SPEC_JSON="{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"enforce_eager\":false}"
 MTLOAD_JSON='{"enable_multithread_load":true,"num_threads":128}'
 
