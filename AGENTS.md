@@ -162,6 +162,22 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 | KV 池起得来但没接上 | 池是**静默失效型** | `grep -c 'Creating v1 connector'` 期望 8；见 README §6 |
 | 端口 8000 被占 | 本机有别的吃 8 卡容器（如 `dsv41-rc2`） | 换 `PORT=`；或先停掉；必要时调 `ALLOW_FOREIGN` |
 | KV 容量每次差 ±128 | 固定 HBM 下按 `block_size=128` 取整 | 不是参数变化，正常 |
+| `/start_profile` 返回 404 | 起服时没带 `--profiler-config` | 用 `PROFILER=1` 起服（根脚本透传给 `rc2/serve.sh`）|
+| 剖面工具报 `no per-step marker kernel found` | 工具里写死了 **V1** 的 marker 名 | V2 是 `_compute_slot_mappings_kernel`，见 `rc2/bench/step_markers.py` |
+| 剖面 span 只有 0.017 ms、hole≈0 | 把两个 V2 marker **混用**了 | V2 两个 marker 同一步内相距 0.017 ms，只能取**单一序列** |
+| 剖面每步 285 ms 而不是 58 ms | prefill 也触发了同一个 marker | 用 `--decode-only` / `rank_balance.py` 的 decode 过滤 |
+| `overlap.py` 报 `need at least three step barriers, found 0` | V2 trace 里没有 `Event::synchronize` | 该工具仅适用 V1；V2 用 `gap_attr.py` |
+
+### 剖面口径（2026-10-28 定）
+
+`PROFILER=1` 不改变编译/图（`ProfilerConfig.compute_hash()` 的 factors 为空），但
+**profiled 窗口的每步时延是虚高的，不能拿去和未插桩的运行比**——只用来看构成和占比。
+
+- 窗口要等**全部流首 token 到齐**再开（`rc2/bench/probe_prof.py`），否则窗口里混进 prefill
+- trace 写 **宿主 `/tmp`**（容器已 `-v /tmp:/tmp`）：8 rank × ~700 MB，写 NFS 会卡
+- `torch_npu.profiler.profiler.analyse()` 必须在**容器内**跑（要 torch_npu），单 rank 约 77 s
+- c=16 实测：设备空档 2.5 ms/步、被 host 覆盖的仅 0.29 ms ⇒ **host 侧已无可削空间**，
+  且通信与计算**零重叠**（10 ms/步全在关键路径上）
 
 ### 历史事故（改脚本/补丁前值得知道）
 
