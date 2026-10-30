@@ -55,6 +55,7 @@
 | `0002-dsa-v41.patch` | 1 | +174/−51 | `attention/dsa_v41.py`。V2 主路径：`_sentinel`/`_build_consts` 记忆化、`where(out=)` 原地写回、Triton 槽位映射、QLI no-candidate、槽位链组内复用 | 启用 |
 | `0003-dsa-v1-o-proj-2d.patch` | 1 | +37/−1 | `attention/dsa_v1.py`。`wo_a` 退化 batch matmul → 2D matmul | 启用（改动由 `V41_O_PROJ_2D` 门控，默认关） |
 | `0004-model-opts.patch` | 5 | +172/−12 | 模型侧五项：`engram/layer.py`（wkv TP 分片）、`indexer.py`（QLI）、`model.py`（wkv 分片镜像）、`fused_moe/token_dispatcher.py`（mask-range）、`ops/rope_dsv4.py`（index_select） | 启用 |
+| `0005-packed-cache-slot-mapping-scalar.patch` | 1 | +46/−7 | `ops/triton/packed_cache_slot_mapping.py`。A2 的 AIV 标量单元用软件模拟 64 位整数除法，而这个内核只搬几百字节却 89% 时间在标量管线。改为 int32 计算 + 2 的幂 page 用移位/掩码（page 96/100 保留除法路径，由 constexpr `POW2_PAGE` 门控） | 启用 |
 | `0101-kvpool-mrv2-resume.patch` | 1 | +9/−0 | `pool_scheduler.py`。MRV2 抢占恢复时 `_preempted_req_ids` 未清理，会把错误 block 关联到池 key（**静默算错**）。上游 `6197fec5c` / #19693 的等价修复，2 行 | 启用 |
 | `vllm.patch` | 1 | +64/−3 | `tokenizers/deepseek_v41_encoding.py`：控制 token 注入（防伪造轮次边界）、空 developer 消息 | 启用 |
 
@@ -67,6 +68,7 @@
 | 文件 | 作用 |
 |---|---|
 | `tests/ut/distributed/ascend_store/test_mrv2_preempt_marker.py` | `0101` 的定向回归。验证 MRV2 抢占标记被 `_process_new_request` 消费 |
+| `tests/ut/ops/triton/test_packed_cache_slot_mapping.py` | `0005` 的定向回归，33 项。7 组 page/ratio/skip/dtype 组合 × 4 种 token/req 形状对比 eager 参考；含 `test_padded_tail_is_masked_for_ratio1`（把内核既有语义钉死）与坏参数拒绝 |
 
 **注意**：该用例 import 了 `tests.ut.distributed.ascend_store._mock_deps`，而
 **这个文件目前不在仓库里**（也无 `__init__.py`）。要在仓库内直接跑通需要补齐
