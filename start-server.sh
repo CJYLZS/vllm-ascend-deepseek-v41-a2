@@ -415,6 +415,11 @@ ADDL_JSON='{"enable_cpu_binding":true,"ascend_compilation_config":{"enable_npugr
 SPEC_JSON="{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"enforce_eager\":false}"
 MTLOAD_JSON='{"enable_multithread_load":true,"num_threads":128}'
 
+# jemalloc：路径必须探测（见 base.sh 的 base_jemalloc）。写死会在换基座后
+# 从"生效"变成"静默回退 glibc malloc"，只在日志里留一行容易被当噪声的 ld.so 警告。
+JEMALLOC_EFF="$(base_jemalloc "$IMAGE")"
+[ -z "$JEMALLOC_EFF" ] || echo "[start] ld_preload=$JEMALLOC_EFF"
+
 RUN_ARGS=(
   --name "$NAME" --privileged --network host --shm-size 512g
   --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
@@ -428,7 +433,7 @@ RUN_ARGS=(
   -e TASK_QUEUE_ENABLE=1
   -e OMP_NUM_THREADS="${OMP_NUM_THREADS:-10}"
   -e LOCAL_WORLD_SIZE="$TP"
-  -e LD_PRELOAD="${JEMALLOC:-/usr/lib/aarch64-linux-gnu/libjemalloc.so.2}"
+  ${JEMALLOC_EFF:+-e LD_PRELOAD=$JEMALLOC_EFF}
   "${PASSTHRU_ENVS[@]}"
   "${KV_ENVS[@]}"
   "${PGO_MOUNTS[@]}"

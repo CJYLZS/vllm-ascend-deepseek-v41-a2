@@ -117,7 +117,9 @@ base_pgo_dest() {
     # 一次 0.7 s 的容器启动。相比 600 s 的起服可以忽略，而它换来的是
     # "换基座不用改脚本"。输出必须形如 /*.so* 才算数：DRY_RUN 会把 docker
     # 换成只回显命令的替身，那种情况下这里必须走到兜底分支。
-    dest=$(docker run --rm --entrypoint python3 "$img" -c '
+    local dk=docker
+    if [ "${DRY_RUN:-0}" = "1" ] && [ -x /usr/bin/docker ]; then dk=/usr/bin/docker; fi
+    dest=$($dk run --rm --entrypoint python3 "$img" -c '
 import os, sysconfig
 d = sysconfig.get_config_var("LIBDIR")
 n = sysconfig.get_config_var("INSTSONAME") or ("libpython%s.so.1.0" % sysconfig.get_config_var("VERSION"))
@@ -144,6 +146,53 @@ print(os.path.join(d, n) if d and n else "")' 2>/dev/null | tail -1 || true)
     echo "[base]       PGO 可能挂到不存在的目录（静默失效）。确认后用 PGO_DEST=... 覆盖。" >&2
   }
   printf '%s' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# base_jemalloc <image> —— 探测镜像内可用的 jemalloc，返回容器内路径
+#
+# 为什么必须探测：LD_PRELOAD 指向不存在的文件时 ld.so 只打一行
+#   "cannot be preloaded ... ignored" 就继续跑 —— **静默回退到 glibc malloc**。
+# 每进程一行、8 rank 起服日志里几十行，但服务照常可用，很容易被当成噪声忽略。
+# rc2 镜像里有 /usr/lib/aarch64-linux-gnu/libjemalloc.so.2，v0.30.0 镜像**没有**，
+# 同一个写死路径于是从"生效"变成"静默失效"。
+#
+# 找不到任何可用的 jemalloc 时返回空串（调用方据此不传 LD_PRELOAD），
+# 而不是传一个必然失败的路径。
+# ---------------------------------------------------------------------------
+base_jemalloc() {
+  local img="${1:-${IMAGE:-}}"
+  local p=""
+
+  # 显式覆盖优先（JEMALLOC=... 是旧有逃生阀，保持兼容；空串 = 显式关闭）
+  if [ -n "${JEMALLOC+x}" ]; then
+    printf '%s' "${JEMALLOC}"
+    return 0
+  fi
+
+  # DRY_RUN 下 PATH 里的 docker 是"只回显命令"的替身（见工作区根 start-server.sh），
+  # 用它探测只会拿到一坨命令文本。这里显式走 /usr/bin/docker，让**预览与实跑一致**。
+  local dk=docker
+  if [ "${DRY_RUN:-0}" = "1" ] && [ -x /usr/bin/docker ]; then dk=/usr/bin/docker; fi
+
+  if [ -n "$img" ] && command -v docker >/dev/null 2>&1; then
+    # 一次 ~0.7 s 的容器启动；候选顺序 = 通用路径在前，镜像自带的后备在后。
+    p=$($dk run --rm --entrypoint bash "$img" -c '
+for f in /usr/lib/aarch64-linux-gnu/libjemalloc.so.2 \
+         /usr/lib/aarch64-linux-gnu/libjemalloc.so \
+         /usr/lib64/libjemalloc.so.2 \
+         /usr/local/Ascend/cann-*/aarch64-linux/lib64/libjemalloc.so; do
+  [ -f "$f" ] && { printf "%s" "$f"; break; }
+done' 2>/dev/null | tail -1 || true)
+    case "$p" in
+      /*) printf '%s' "$p"; return 0 ;;
+      *)  p="" ;;
+    esac
+  fi
+
+  [ "${DRY_RUN:-0}" = "1" ] || \
+    echo "[base] 注意：$img 里找不到 jemalloc，本次不设 LD_PRELOAD（回退 glibc malloc）" >&2
+  printf '%s' ""
 }
 
 # base_tree_dir —— 树产物目录名（相对补丁仓库根），供文档/脚本打印
