@@ -3,8 +3,14 @@
 面向接手本仓库的**人或 AI agent**。README 讲「怎么部署」，本文讲「这个仓库内部
 长什么样、改东西时踩哪些坑」。**动手前先读 §1 和 §5。**
 
-基线：`vllm-ascend v0.30.0rc2`（`8fde6d4e3`）、`vllm v0.30.0`（`ced6857af`）。
-默认启用 Model Runner V2。
+基线：`vllm-ascend v0.30.0`（`c09d3e20b`）、`vllm v0.30.0`（`ced6857`）、
+CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
+
+> **分支 = 基座**。`main`/`v1`/`v2` 挂 `v0.30.0rc2`（`8fde6d4e3`，树 `tree/`，
+> PGO `pgo/optim/pgo/`）；本分支 `v0300` 挂 `v0.30.0`（`c09d3e20b`，树 `tree-v0300/`，
+> PGO `pgo/optim/pgo-3.12.16/`）。两个基座的产物并存、互不覆盖。
+> 基座身份唯一来源 = `base.conf`；三个起服入口都从它取值，**不要在别处写死镜像名
+> 或 python 版本号**（写死 python 版本会让 PGO 静默失效，见 §5.1）。
 
 ---
 
@@ -77,18 +83,24 @@ mock 依赖，或者按 `b27a32d` 提交里记录的方式，把它拷进 vllm-a
 
 ### 2.4 分层原则（升级基线时用）
 
-`series.conf` 头部记录了上游 `v0.30.0rc2`(8fde6d4e3) → main 452 提交的实测 churn：
+`series.conf` 头部记录了本轮 **`v0.30.0rc2`(8fde6d4e3) → `v0.30.0`(c09d3e20b)**
+共 **320 提交**的实测 churn（2026-11-02 逐文件比对两个镜像得出，非估算）：
 
 | 文件 | 上游 churn | 含义 |
 |---|---|---|
-| `dsa_v1.py` | 11 提交 +623/−159 | **冲突重灾区**，但改动默认关闭，可延后 |
-| `dsa_v41.py` | 5 提交 +153/−4 | 需重点评估 |
-| `model.py` | 7 提交 +46/−1 | 需评估 |
-| `rope_dsv4.py` | 1 提交 | 轻 |
-| `engram/layer.py` / `indexer.py` / `token_dispatcher.py` | 0 提交 | **零冲突** |
+| `envs.py` | 0 | 逐字节相同；6 个 gate 仍不存在 ⇒ `0001` 必须留 |
+| `dsa_v41.py` | 0 | 逐字节相同 |
+| `model.py` | 0 | 逐字节相同 |
+| `indexer.py` / `engram/layer.py` / `rope_dsv4.py` / `token_dispatcher.py` | 0 | **零冲突** |
+| `attention_v1.py` / `packed_cache_slot_mapping.py` | 0 | 逐字节相同（`0005` 原样可打） |
+| `dsa_v1.py` | +11/−14 | 全是上游自用重构（`full_graph_mode` 显式入参、o_proj 缓冲按 `get_potential_max_tokens()`），与 `0003` 无关 |
+| `pool_scheduler.py` | +44/−74 | **吸收了我们原来的 `0101`**（`1b06b6cc6`） |
 
-升级到新基线（例如 0.31.0rc1）时：先重做 `0001`（纯新增，几乎不会冲突），
-再按上表自下而上处理。
+结论：**12 个补丁目标文件里 10 个逐字节未变**，只有 `dsa_v1.py` 有无关重构、
+`pool_scheduler.py` 吸收了 `0101`。所以本轮升级成本极低（5 个 0xxx 全部干净应用）。
+
+下一次升级到新基线时，照 `README.md` §11 的流程走：改 `base.conf` → 逐补丁
+`git apply --check` → `PREPARE_ONLY=1` 建树 → `DRY_RUN=1` 校验命令。
 
 ---
 
@@ -211,6 +223,20 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
   8000 端口，起服以各种奇怪方式失败（HBM 不够 / HCCL 超时）。现加前置拦截。
 - **MRV2 抢占恢复算错**（`b27a32d`）：`_preempted_req_ids` 未清理，把错误 block
   关联到池 key，**静默算错**而非报错。`0101` 修复。
+  后记（v0300）：上游 `1b06b6cc6` 已含同样 2 行，`0101` 退役。闸门仍在
+  （`kv_offload.sh` 判"那行代码在不在"，不关心谁写的），所以将来上游改掉它会照样拦住。
+- **PGO 挂载点写死 python 版本 ⇒ 静默失效**（v0300 升级时发现，**最阴的一类**）：
+  `serve.sh` 与 `start-server.sh` 原本都写死
+  `/usr/local/python3.12.13/lib/libpython3.12.so.1.0`。基座换到 `v0.30.0` 后
+  镜像 python 变成 **3.12.16**，于是：
+  docker 自动创建那个不存在的父目录 → 挂载**"成功"** → 解释器按 DT_RPATH 加载
+  镜像自带的库 → **PGO 完全没生效**。
+  而 `docker inspect`、启动日志、`sys.version` 全都看不出异常（不逐条 `ldd`
+  根本发现不了），白丢 −3.2~5.1%。
+  现改为 `base.sh` 的 `base_pgo_dest` **起一次性容器探测镜像内 LIBDIR**（0.7 s），
+  探测失败会显式告警而不是静默挂空目录。`PGO_DEST=` 仍可显式覆盖。
+  > 教训：凡"宿主机路径 → 容器内路径"的挂载，只要容器内路径带版本号，
+  > 就必须探测、不能写死。同类还有 `--entrypoint` 的绝对路径、`LD_PRELOAD` 的库名。
 
 ---
 
@@ -238,11 +264,24 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 
 ## 7. 分支
 
-| 分支 | 内容 |
-|---|---|
-| `main` | 当前（V2）。补丁拆分为 `series.conf` + `patches/`，含 KV offload |
-| `v1` | V1 旧版（`3d429b6`）。单文件 `vllm-ascend.patch` 1788 行，12 个 gate，`VLLM_USE_V2_MODEL_RUNNER=0` |
-| `v2` | 与 `main` 同 commit 的历史别名，保留兼容 |
+| 分支 | 基座 | 内容 |
+|---|---|---|
+| `v0300` | **`v0.30.0` (c09d3e20b)** | ★ **当前**。CANN 9.2.1 / python 3.12.16。树 `tree-v0300/`，PGO `pgo/optim/pgo-3.12.16/`。`0101` 退役，5 补丁 + `vllm.patch` |
+| `main` | `v0.30.0rc2` (8fde6d4e3) | rc2 基线（保留为可复现的对照臂）。补丁拆分为 `series.conf` + `patches/`，6 补丁含 `0101`；树 `tree/` |
+| `v1` | `v0.30.0rc2` | V1 旧版（`3d429b6`）。单文件 `vllm-ascend.patch` 1788 行，12 个 gate，`VLLM_USE_V2_MODEL_RUNNER=0` |
+| `v2` | `v0.30.0rc2` | 与 `main` 同 commit 的历史别名，保留兼容 |
+
+### 7.1 为什么按基座开分支，而不是原地改
+
+一个分支 = 一个基座。三个原因，每个都对应一次真实会踩的坑：
+
+1. **实测数据依附基座**。README 那两张表是在 rc2 上量的；原地换基座后旧数字留在
+   同一张表里，读的人无法分辨哪些还成立 —— 那是"看起来有效、其实换了底"的假数据。
+2. **`tree/` 是 gitignored 单份产物**。两分支共用 `tree/` 时，切分支就会原地重建、
+   把另一条基座的树覆盖掉，旧基座从此不可复现。所以 `base.conf` 的 `BASE_TREE_DIR`
+   按分支分家（`tree/` vs `tree-v0300/`）。
+3. **PGO 产物按 python 版本分家**。3.12.13 与 3.12.16 的产物互不兼容，同一目录会互相
+   覆盖。`optim/pgo/` 与 `optim/pgo-3.12.16/` 并存。
 
 ---
 

@@ -130,17 +130,21 @@ EOF
   echo "[kv]            meta=$KV_META_NAME :$KV_META_PORT/:$KV_STORE_PORT/:$KV_METRICS_PORT"
 }
 
-# 0101（= 上游 6197fec5c 的等价 2 行）只在挂池时有意义，但它决定**正确性**：
-# MRV2 抢占恢复后不清 _preempted_req_ids，下一次 RUNNING delta 会走抢占分支、
+# MRV2 抢占恢复后若不清 _preempted_req_ids，下一次 RUNNING delta 会走抢占分支、
 # 用新 block 表覆盖已有的，把**错误的 block** 关联到池 key 上 —— 之后命中池
 # 就是读到别人的 KV。日志不报错，所以必须前置拦。
+#
+# ★ 这道闸门判的是"**那行代码在不在**"，不关心是谁写的：
+#   v0300 分支起，上游 1b06b6cc6 已自带该修复（pool_scheduler.py:825），
+#   所以我们自己的 0101 退役了、这道闸门却仍然有意义 —— 将来换基座时若上游
+#   把这一行改掉/挪走，它照样会在起服前拦住，而不是等抢占发生后静默算错。
 kv_offload_require_tree_fix() {
   # 判据用 KV_OFFLOAD 而不是 KV_ACTIVE：这样调用方先校验再 plan、或先 plan 再
   # 校验都行，不会因为顺序不同静默跳过这道闸门（曾写成 KV_ACTIVE，先调即失效）。
   [ "$KV_OFFLOAD" = "1" ] || return 0
   local tree_root="${1-}" f="" why=""
   if [ -z "$tree_root" ]; then
-    why="当前挂的是镜像自带的 stock 树（SRC=0），它不可能有 0101"
+    why="当前挂的是镜像自带的 stock 树（SRC=0）"
   elif [ ! -f "$tree_root/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py" ]; then
     why="找不到 $tree_root/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py"
   else
@@ -148,11 +152,11 @@ kv_offload_require_tree_fix() {
     if grep -q '_preempted_req_ids\.discard(request\.req_id)' "$f"; then
       # start-server.sh 先校验一次、serve.sh 再兜底一次（两人都可能单独被调用），
       # 成功行只说一次；export 让子进程也看到这个标记。
-      [ "${KV_TREE_FIX_VERIFIED:-0}" = "1" ] || echo "[kv] 挂载树含 0101 修复（MRV2 抢占恢复）"
+      [ "${KV_TREE_FIX_VERIFIED:-0}" = "1" ] || echo "[kv] 挂载树含 MRV2 抢占恢复修复（v0300 起由上游 1b06b6cc6 提供）"
       KV_TREE_FIX_VERIFIED=1; export KV_TREE_FIX_VERIFIED
       return 0
     fi
-    why="挂载树 $tree_root 里 _process_new_request 缺 0101 那 2 行（stock rc2 就是这样）"
+    why="挂载树 $tree_root 的 pool_scheduler.py 里缺 _preempted_req_ids.discard(request.req_id) 这一行"
   fi
   if [ "$KV_ALLOW_UNFIXED_TREE" = "1" ]; then
     echo "[kv] 警告：$why" >&2
@@ -160,14 +164,14 @@ kv_offload_require_tree_fix() {
     return 0
   fi
   {
-    echo "FATAL: KV_OFFLOAD=1 但源码树不含 KV 池的 MRV2 修复"
+    echo "FATAL: KV_OFFLOAD=1 但源码树不含 KV 池的 MRV2 抢占恢复修复"
     echo "       原因：$why"
     echo "       后果：请求被抢占后，池 key 会关联到错误的 block —— 命中池即读到别人的 KV，"
     echo "             输出错但日志不报错（这是正确性问题，不是性能问题）。"
     echo "       三种处理："
-    echo "         ① 挂补丁仓库的树（已含 0101）："
-    echo "              SRC_ROOT=<补丁仓库>/tree bash $0"
-    echo "         ② 把补丁仓库的 patches/0101-kvpool-mrv2-resume.patch 固化进 rc2/stable（见 AGENTS.md §3.1）"
+    echo "         ① 挂补丁仓库的树（v0300 分支由上游代码满足；rc2 基座由 0101 补丁满足）："
+    echo "              SRC_ROOT=<补丁仓库>/<tree 目录> bash $0"
+    echo "         ② rc2 基座可把 patches/0101-kvpool-mrv2-resume.patch 加回 series.conf"
     echo "         ③ 明知有风险仍要跑：KV_ALLOW_UNFIXED_TREE=1 bash $0"
   } >&2
   exit 8

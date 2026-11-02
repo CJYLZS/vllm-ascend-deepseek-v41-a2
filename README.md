@@ -2,15 +2,31 @@
 
 在 **8 × Ascend 910B3（A2）** 单机上服务
 [`DeepSeek-V4.1-Flash-1017-w4a8-Ascend`](https://www.modelscope.cn/models/chiro2001/DeepSeek-V4.1-Flash-1017-w4a8-Ascend)，
-基于官方 **vllm-ascend v0.30.0rc2**，默认启用 **Model Runner V2**。
+基于官方 **vllm-ascend v0.30.0**，默认启用 **Model Runner V2**。
 
-基线：`vllm-ascend v0.30.0rc2`（`8fde6d4e3`）、`vllm v0.30.0`（`ced6857af`）。
+基线：`vllm-ascend v0.30.0`（`c09d3e20b`）、`vllm v0.30.0`（`ced6857`）、
+CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `base.conf`。**
+
+> ### ⚠ 分支 = 基座
+>
+> | 分支 | 基座镜像 | 上游 commit | 树目录 | PGO 产物 |
+> |---|---|---|---|---|
+> | `main` / `v1` / `v2` | `v0.30.0rc2` | `8fde6d4e3` | `tree/` | `pgo/optim/pgo/`（3.12.13 自编） |
+> | **`v0300`（本分支）** | **`v0.30.0`** | **`c09d3e20b`** | **`tree-v0300/`** | **`pgo/optim/pgo-3.12.16/`（3.12.16 官方预编）** |
+>
+> 两个基座的树与 PGO 产物**并存、互不覆盖**，A/B 随时切。
+> 换基座请**开新分支**，不要原地改 `main` —— README 里每张表都依附基座身份。
 
 ## 实测数据
 
 单机 8 × 910B3（A2），TP8/EP8，temperature=0。测的是**默认档**
 （V2 runner + 6 个 gate + 共享专家多流 + PGO + `HCCL_OP_EXPANSION_MODE=AIV`
 + `0005` 槽位映射标量化，挂 2 GB/rank KV 外部池）。
+
+> ⚠ **下面两张表都是 `v0.30.0rc2` 基座（`main` 分支）上测的。**
+> `v0300` 分支换到了 `v0.30.0` 基座，**数字尚未重测**，不可直接引用。
+> rc2 → v0.30.0 的静态评估结论是"对 A2 + DSV4.1 预期无显著收益（乐观 0.5~1%）"，
+> 但那是估算、不是实测；新基座的全档数据待补。
 
 每步时延取 5 次重复的中位；吞吐取同一组重复中的最高值，并附该次的 `A_spec`。
 
@@ -42,7 +58,7 @@
 | 硬件 | 单机 8 × 910B3（A2），每卡 HBM 65536 MB |
 | OS / 架构 | Linux `aarch64` |
 | 驱动 | 25.5.6 |
-| 镜像 | `vllm-ascend:v0.30.0rc2`（公开可用 `quay.io/ascend/vllm-ascend:v0.30.0rc2`） |
+| 镜像 | **`vllm-ascend:v0.30.0`**（本分支；`main` 分支是 `v0.30.0rc2`）—— 取值见 `base.conf` |
 | 权重 | 见 §1.1 |
 | 其他 | `docker`、`tar`，`git` 或 `patch` 之一 |
 
@@ -74,7 +90,8 @@ cd engram_int8 && bash reassemble_engram_weights.sh
 ## 2. 快速开始
 
 ```bash
-export IMAGE=quay.io/ascend/vllm-ascend:v0.30.0rc2
+# 镜像不必显式给：默认取 base.conf 的 BASE_IMAGE（本分支 = v0.30.0）
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.30.0
 export MODEL=/path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
 
 bash start-server.sh                      # 起服（首次自动准备源码树并打补丁）
@@ -161,15 +178,26 @@ vllm/vllm/_rust_tool_parser.abi3.so、vllm/vllm/vllm-rs
 
 ## 5. 可选：PGO 版 libpython
 
+默认已开。产物路径取自 `base.conf` 的 `BASE_PGO_SO_REL`，**落点由镜像探测**
+（`base.sh` 的 `base_pgo_dest`），不再写死 python 版本号：
+
 ```bash
-PGO_SO=/path/to/libpython3.12.so.1.0 bash start-server.sh
+# 默认：base.conf 指到 pgo/optim/pgo-3.12.16/libpython3.12.so.1.0（3.12.16 预编 PGO+LTO）
+# 覆盖：PGO_SO=/path/to/libpython3.12.so.1.0 bash start-server.sh
+# 关掉：PGO=0 bash start-server.sh
 ```
 
-挂到 `/usr/local/python3.12.13/lib/libpython3.12.so.1.0`。实测每步 decode 时延
-−3.2~5.1%。镜像原版 md5 `0709a2b39e034d403f3d72788ba12beb`，回退就是不设这个变量。
+| 基座 | 产物 | 来源 |
+|---|---|---|
+| `v0.30.0rc2`（main） | `pgo/optim/pgo/` | 本机自编，python 3.12.13，md5 `68cfbe78…` |
+| **`v0.30.0`（本分支）** | **`pgo/optim/pgo-3.12.16/`** | **官方预编译，python 3.12.16，md5 `72675e2b…`** |
 
-⚠ 该 `.so` 必须在**目标机**上编译（构建指纹含 CPU 型号、gcc、glibc、源码 sha），
-本仓库不含此产物。不装不影响其余优化。
+- rc2 上实测每步 decode 时延 **−3.2~5.1%**（均值 −4.27%，6 档全降）。
+- **v0300 这份 3.12.16 产物的实际增益尚未实测**，换基座后需重做 PGO on/off 对照。
+- ⚠ **落点写死版本号是最阴的坑**：镜像 python 从 3.12.13 变 3.12.16 后，
+  写死的旧路径会让 docker 自动建一个空目录、挂载"成功"、解释器根本不加载它
+  ⇒ PGO 完全失效，而 `docker inspect` / 启动日志 / `sys.version` 全都看不出异常。
+  现已改为探测，理由与验证记录见 `rc2/docs/PGO_31216.md`。
 
 > PGO 收益只看**每步时延**。吞吐会被 `A_spec` 抽签噪声盖住，跨进程比吞吐会得出相反结论。
 
@@ -311,9 +339,11 @@ logs / plog / npulog / 编译缓存落在 `$LOG_DIR`（默认 `./runtime/<hostna
 ## 10. 兼容性提醒
 
 - **不要用 `vllm_ascend/_version.py` 判断实际跑的代码**：它由构建期生成，本补丁没重新生成，
-  仍报 `0.30.0rc2` / `g8fde6d4e3`。要看真实状态用
-  `git -C $SRC_DIR/vllm-ascend log --oneline -1`。
-- 补丁针对 `v0.30.0rc2` 原样应用。镜像里 `/vllm-workspace` 的树被改过则 `git apply` 失败，
+  报的仍是镜像构建期那版。要看真实状态用
+  `git -C $SRC_DIR/vllm-ascend log --oneline -1`（本分支应为 `c09d3e20b`）。
+- 补丁针对 `v0.30.0`（`c09d3e20b`）原样应用，5 个 0xxx 全部干净通过。
+  **`0101` 在本分支已退役** —— 上游 `1b06b6cc6` 已含等价修复（`pool_scheduler.py:825`），
+  详见 `series.conf` 末尾。镜像里 `/vllm-workspace` 的树被改过则 `git apply` 失败，
   脚本立刻报错，不会静默。
 - 只验证过 8 卡 TP8/EP8 单机，改 `TP` 未测。
 - Model Runner V2 在 vllm-ascend 侧标注 `[Experimental]`；官方 DeepSeek-V4 + dspark 的 e2e
@@ -324,9 +354,45 @@ logs / plog / npulog / 编译缓存落在 `$LOG_DIR`（默认 `./runtime/<hostna
 
 ---
 
-## 11. 补丁清单
+## 11. 换基座（升级到新镜像）怎么做
 
-`series.conf` 里 6 个补丁 + 1 个 vllm 侧补丁，按职责分两层：
+**开新分支，不要原地改。** 一个分支 = 一个基座。
+
+```bash
+cd rc2/patches/vllm-ascend-deepseek-v41-a2
+git checkout -b v0310 main          # 从 main 或上一个基座分支拉
+
+# 1) 只改 base.conf：镜像名 / 镜像 Id / 上游 commit / CANN / python / triton / 树目录
+$EDITOR base.conf
+
+# 2) 逐补丁试打，退役被上游吸收的（本次是 0101）
+for p in $(grep -v '^#' series.conf | grep -v '^$'); do
+  git -C /tmp/probe apply --check patches/$p && echo "OK $p" || echo "FAIL $p"
+done
+
+# 3) 建树（★ 不重启、不动正在跑的服务）
+MODEL=<权重目录> PREPARE_ONLY=1 bash start-server.sh
+
+# 4) 校验生成的命令（不碰卡）
+DRY_RUN=1 bash start-server.sh
+```
+
+`PREPARE_ONLY=1` 是专门为此加的：只建树 + 校验 gate 定义 + 探测 PGO 落点，
+**不建容器、不碰端口、不动卡**，所以可以在服务照常跑的时候准备好新基座，
+两棵树并存随时 A/B。真正切过去才需要重启（届时 `FORCE=1`）。
+
+换基座时逐项确认（漏掉任何一项都是静默失效）：
+
+- [ ] `base.conf` 的 `BASE_IMAGE_ID` 与 `docker image inspect` 实测一致
+- [ ] `BASE_TREE_DIR` 换了新名字（否则切分支会原地覆盖另一条基座的树）
+- [ ] `BASE_PGO_SO_REL` 指向与镜像 python 版本**匹配**的 PGO 产物
+- [ ] `series.conf` 里被上游吸收的补丁已退役
+- [ ] `tree-*/` 里的 `.patches-applied` 第 3 行 = 本次镜像 Id
+- [ ] 本 README 的实测数据表标注清楚基座，新基座的表重测后补齐
+
+## 12. 补丁清单
+
+`series.conf` 里 **5 个补丁 + 1 个 vllm 侧补丁**（本分支；`0101` 已退役，见下），按职责分两层：
 
 | 补丁 | 作用 |
 |---|---|
@@ -335,5 +401,5 @@ logs / plog / npulog / 编译缓存落在 `$LOG_DIR`（默认 `./runtime/<hostna
 | `0003-dsa-v1-o-proj-2d.patch` | `attention/dsa_v1.py` 的 `wo_a` 由退化 batch matmul 改 2D matmul。改动由 `V41_O_PROJ_2D` 门控、**默认关闭** |
 | `0004-model-opts.patch` | 模型侧五项：`engram/layer.py`（wkv TP 分片）、`indexer.py`（QLI）、`model.py`（wkv 分片镜像）、`fused_moe/token_dispatcher.py`（mask-range）、`ops/rope_dsv4.py`（index_select） |
 | `0005-packed-cache-slot-mapping-scalar.patch` | `ops/triton/packed_cache_slot_mapping.py`。A2 的 AIV 标量单元用软件模拟 64 位整数除法，而这个内核只搬几百字节却 89% 时间卡在标量管线。改为 int32 计算，2 的幂 page 用移位/掩码（非 2 的幂保留除法路径） |
-| `0101-kvpool-mrv2-resume.patch` | KV 外部池正确性修复：MRV2 抢占恢复后未清 `_preempted_req_ids`，会把错误 block 关联到池 key（**静默算错**）。上游 `6197fec5c` 的等价 2 行，只有挂池时才有意义 |
+| ~~`0101-kvpool-mrv2-resume.patch`~~ | **本分支已退役。** KV 外部池正确性修复：MRV2 抢占恢复后未清 `_preempted_req_ids`，会把错误 block 关联到池 key（**静默算错**）。理由：上游 `1b06b6cc6`（PR #19567）已含**同样的 2 行**（`pool_scheduler.py:825`），本分支 `git apply` 会直接报 "patch does not apply"。补丁文件保留在 `patches/`（`main` 分支仍在用），但**不写进本分支的 `series.conf`**。正确性闸门仍在：`kv_offload.sh` 判的是"那行代码在不在"，将来上游改掉它会照样拦住 |
 | `vllm.patch` | vllm 侧 `tokenizers/deepseek_v41_encoding.py`：控制 token 逃逸，防伪造轮次边界 |

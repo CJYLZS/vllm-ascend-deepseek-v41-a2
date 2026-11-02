@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start-server.sh —— 起 DeepSeek-V4.1-Flash（vllm-ascend v0.30.0rc2 + v25 补丁）
+# start-server.sh —— 起 DeepSeek-V4.1-Flash（基座见 base.conf，本分支 = v0.30.0）
 #
 # 单机 8 卡（Ascend 910B3 / A2）已验证配置。参数取自一次真实在跑的服务
 # （docker inspect 逐项核对），不是从文档抄的。
 #
-#   IMAGE=... MODEL=... bash start-server.sh          # 首次会自动准备源码树
-#   IMAGE=... MODEL=... DRY_RUN=1 bash start-server.sh # 只打印 docker 命令
-#   IMAGE=... MODEL=... WAIT=1 bash start-server.sh    # 前台等到 READY 并自检
-#   IMAGE=... MODEL=... FORCE=1 bash start-server.sh   # 先停旧容器
+#   MODEL=... bash start-server.sh                     # 镜像取 base.conf 的 BASE_IMAGE
+#   IMAGE=... MODEL=... bash start-server.sh           # 覆盖基座镜像（自己负责重建树）
+#   MODEL=... DRY_RUN=1 bash start-server.sh           # 只打印 docker 命令
+#   MODEL=... WAIT=1 bash start-server.sh              # 前台等到 READY 并自检
+#   MODEL=... FORCE=1 bash start-server.sh             # 先停旧容器
 #   BAT=8192 bash start-server.sh                      # 任何值都可用同名 env 覆盖
 #   KV_OFFLOAD=1 bash start-server.sh                  # 挂 KV 外部池（默认 2GB/卡）
 #
-# 必填：IMAGE（v0.30.0rc2 镜像）、MODEL（权重目录）
+# ★ 镜像名 / python 版本 / 树目录 / PGO 落点全部来自 base.conf + base.sh，本文件
+#   **不再写死任何一个**。换基座 = 开新分支 + 改 base.conf，见 base.conf 头注释。
+#
+# 必填：MODEL（权重目录）。IMAGE 缺省取 base.conf 的 BASE_IMAGE。
 # 停服务：docker stop "$NAME"    健康：curl -s -o /dev/null -w '%{http_code}\n' \
 #                                      http://127.0.0.1:8000/health
 # =============================================================================
@@ -20,10 +24,28 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
+# ---- 基座身份（唯一来源 base.conf）-----------------------------------------
+# base.sh 只做"能算出就赋值"，缺 base.conf 时全部留空，下面的 ${IMAGE:?} 会兜住。
+source "$HERE/base.sh"
+
 # ---- 必填项 --------------------------------------------------------------
-: "${IMAGE:?请用 IMAGE=<v0.30.0rc2 镜像> 指定镜像，例如 IMAGE=quay.io/ascend/vllm-ascend:v0.30.0rc2}"
+: "${IMAGE:=${BASE_IMAGE:-}}"
+: "${IMAGE:?请用 IMAGE=<镜像> 指定（本分支 base.conf 的 BASE_IMAGE 未设置）}"
 : "${MODEL:?请用 MODEL=<权重目录> 指定模型，目录下必须有 config.json}"
 [[ -f "$MODEL/config.json" ]] || { echo "FATAL: $MODEL/config.json 不存在" >&2; exit 1; }
+
+# base.conf 记的镜像 Id 与实际取到的不一致 ⇒ 同 tag 被重推过，或换错了镜像。
+# 不致命（树的重建判据用的是实测 Id），但必须吵一声：文档里所有实测都挂在这个 Id 上。
+if [ -n "${BASE_IMAGE_ID:-}" ] && [ "$IMAGE" = "${BASE_IMAGE:-}" ]; then
+  _want_id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
+  if [ -n "$_want_id" ] && [ "$_want_id" != "$BASE_IMAGE_ID" ]; then
+    echo "[start] 警告：$IMAGE 的实际 Id 与 base.conf 记录的不一致" >&2
+    echo "[start]       base.conf : $BASE_IMAGE_ID" >&2
+    echo "[start]       实际镜像 : $_want_id" >&2
+    echo "[start]       同 tag 被重推过？本分支的实测数据只对 base.conf 记的那个 Id 成立。" >&2
+  fi
+  unset _want_id
+fi
 
 # ---- 可调项（默认 = 已验证值）--------------------------------------------
 PORT="${PORT:-8000}"
@@ -43,8 +65,14 @@ case "$MULTISTREAM_SHARED_EXPERT" in
   0|false|False) MULTISTREAM_SHARED_EXPERT=false ;;
   *) echo "FATAL: MULTISTREAM_SHARED_EXPERT=$MULTISTREAM_SHARED_EXPERT（应为 0/1）" >&2; exit 2 ;;
 esac
-SRC_DIR="${SRC_DIR:-$HERE/tree}"          # 打补丁后的源码树放这里
-PGO_SO="${PGO_SO:-}"                      # 可选：PGO 版 libpython（见 README §5）
+# 打补丁后的源码树放这里。★ 按分支分家（base.conf 的 BASE_TREE_DIR），
+# 这样 rc2 基座的 tree/ 与本分支的 tree-v0300/ 能**并存**，A/B 随时切；
+# 若两分支共用 tree/，切分支就原地重建、把另一份基座的树覆盖掉（旧树不可复现）。
+SRC_DIR="${SRC_DIR:-${BASE_TREE:-$HERE/tree}}"
+# PGO 版 libpython（见 README §5）。路径来自 base.conf 的 BASE_PGO_SO_REL；
+# 落点由 base_pgo_dest 探测镜像决定，不再写死 python 版本号。
+PGO_SO="${PGO_SO:-}"
+[ -n "$PGO_SO" ] || [ -z "${BASE_PGO_SO_REL:-}" ] || PGO_SO="$HERE/$BASE_PGO_SO_REL"
 LOG_DIR="${LOG_DIR:-$HERE/runtime/$(hostname -s)/$NAME}"
 IMAGE="$IMAGE"; export IMAGE MODEL
 
@@ -105,6 +133,19 @@ LOG="$LOG_DIR/logs/server-$(date '+%Y%m%d-%H%M%S').log"
 # 容器同时抢 8 张卡和 8000 端口 —— 起服会以各种奇怪方式失败（HBM 不够 /
 # 端口占用 / HCCL 初始化超时），而且要好几分钟才发现。
 #
+# PREPARE_ONLY=1：只建/校验源码树，**不碰卡、不碰端口、不启容器**。
+#   用途：换基座 / 改 series.conf 之后，先把新树建好并与旧树并存（A/B 随时切），
+#   而不影响正在跑的服务。这条路上"有没有别的容器占着卡""端口占没占"
+#   全都不相关 —— 以前只能靠 DRY_RUN=1 顺带跳过，但 DRY_RUN 也不写盘，
+#   于是"建树"这件事根本没有一个正规入口。
+PREPARE_ONLY="${PREPARE_ONLY:-0}"
+case "$PREPARE_ONLY" in
+  0|1) ;;
+  *) echo "FATAL: PREPARE_ONLY=$PREPARE_ONLY（应为 0/1）" >&2; exit 2 ;;
+esac
+if [ "$PREPARE_ONLY" = "1" ]; then
+  echo "[start] PREPARE_ONLY=1：只准备源码树 -> $SRC_DIR（不启容器、不动卡）"
+else
 # ALLOW_FOREIGN：本机常驻、与本服务无争用的容器白名单（空格分隔）。
 #   deepseek-v4 是 2026-08 起的陈旧容器，只占着设备节点、不做推理（AGENTS.md
 #   记为"与本工作区无关，别去动"），所以默认放行。真要连它一起管就置空。
@@ -132,6 +173,7 @@ if [ -n "$foreign_host" ]; then
   echo "       先停掉：docker stop$foreign_host" >&2
   echo "       若其中某个确实与本服务无争用，加白名单：" >&2
   echo "         ALLOW_FOREIGN=\"\$ALLOW_FOREIGN <名字>\" bash $0" >&2
+  echo "       只想建树、不动服务：PREPARE_ONLY=1 bash $0" >&2
   exit 2
 fi
 # 端口：走到这里说明 $NAME 不在跑，那么 $PORT 上如果有人在听就是外来的
@@ -139,8 +181,10 @@ if ss -ltn 2>/dev/null | grep -q ":${PORT} "; then
   echo "FATAL: 端口 ${PORT} 已被占用（且 $NAME 未在运行）" >&2
   echo "       查：ss -ltnp | grep :${PORT}" >&2
   echo "       换端口：PORT=8001 bash $0" >&2
+  echo "       只想建树、不动服务：PREPARE_ONLY=1 bash $0" >&2
   exit 2
 fi
+fi   # PREPARE_ONLY
 
 # ---- 源码树：首次从镜像里取出 stock 树，再打两个补丁 ----------------------
 # 为什么要这一步：v25 的改动全在 Python 侧，但运行必需的 .so（C 扩展、CANN 算子、
@@ -326,15 +370,35 @@ fi
 fi   # DRY_RUN_SKIP_TREE
 
 PGO_MOUNTS=()
+PGO_DEST_EFF=""          # 预置：PREPARE_ONLY 的收尾行会引用它（set -u）
 if [ -n "$PGO_SO" ]; then
   [ -f "$PGO_SO" ] || { echo "FATAL: PGO_SO=$PGO_SO 不存在" >&2; exit 1; }
-  PGO_MOUNTS=(-v "$PGO_SO:/usr/local/python3.12.13/lib/libpython3.12.so.1.0:ro")
-  echo "[start] pgo=1 $(md5sum "$PGO_SO" | cut -c1-12)"
+  # ★ 落点必须**探测镜像**，不能写死 /usr/local/python3.12.13/…
+  #   基座从 rc2 换到 v0.30.0 时 python 从 3.12.13 变成 3.12.16。路径写死旧版本时
+  #   docker 会自动创建那个不存在的父目录、挂载"成功"、解释器根本不加载它
+  #   ⇒ PGO 完全失效（值 −3.2~5.1%），而 docker inspect / 启动日志 / sys.version
+  #   全都看不出异常。PGO_DEST=... 仍可显式覆盖（旧逃生阀，保留兼容）。
+  PGO_DEST_EFF="$(base_pgo_dest "$IMAGE")"
+  PGO_MOUNTS=(-v "$PGO_SO:$PGO_DEST_EFF:ro")
+  echo "[start] pgo=1 $(md5sum "$PGO_SO" | cut -c1-12) -> $PGO_DEST_EFF"
+  # 产物来源版本与镜像版本不一致时要说出来：能用（已实测），但那份收益是在
+  # 旧版本上量的，新基座上没复核过。
+  if [ -n "${BASE_PGO_ARTIFACT_PYVER:-}" ] && [ -n "${BASE_PYTHON_VER:-}" ] \
+     && [ "$BASE_PGO_ARTIFACT_PYVER" != "$BASE_PYTHON_VER" ]; then
+    echo "[start] 注意：PGO 产物编自 python ${BASE_PGO_ARTIFACT_PYVER}，镜像自带 ${BASE_PYTHON_VER}（跨版本挂载，已实测可用）" >&2
+    echo "[start]       −3.2~5.1% 是在 ${BASE_PGO_ARTIFACT_PYVER} 上量的，新基座尚未复核。干净做法见 rc2/pgo/README.md" >&2
+  fi
 fi
 
 # ---- KV 外部池（KV_OFFLOAD=1 才启用；实现在 kv_offload.sh）----------------
-# 两件事：① 按挂载树校验 0101（正确性闸门，理由见 kv_offload.sh 里的注释）；
-# ② 写 conf + 起/复用 MetaService，填出 KV_ENVS/KV_MOUNTS/KV_ARGS 三个数组。
+# 两件事：① 按挂载树校验"MRV2 抢占恢复会清 _preempted_req_ids"这行在不在
+#           （正确性闸门，理由见 kv_offload.sh 里的注释）；
+#         ② 写 conf + 起/复用 MetaService，填出 KV_ENVS/KV_MOUNTS/KV_ARGS 三个数组。
+#
+# ★ 本分支起这个闸门**由上游代码满足**，不再靠补丁：0101 已从 series.conf 退役，
+#   因为上游 1b06b6cc6（PR #19567）已含等价修复，见 pool_scheduler.py:825。
+#   闸门判据是"那行代码在不在"，不是"我们打没打过 0101"，所以它照样有意义：
+#   换基座时若上游把这一行改掉，这里仍然会在起服前拦住。
 kv_offload_require_tree_fix "$SRC_DIR/vllm-ascend"
 kv_offload_setup
 export KV_OFFLOAD
@@ -410,6 +474,19 @@ RUN_ARGS=(
 if [ "${DRY_RUN:-0}" = "1" ]; then
   printf 'docker run'; printf ' %q' "${RUN_ARGS[@]}"; echo
   echo "[start] DRY_RUN=1，未启动。log 将写入 $LOG"
+  exit 0
+fi
+
+# ---- PREPARE_ONLY=1：树建好/校验完就收工 --------------------------------
+# 放在这里而不是更早：上面的 gate 自检、PGO 落点探测、docker run 命令拼装都是
+# "这棵树配不配这套参数"的校验，正是建完树之后最该跑的东西。到这一步为止
+# **一次 docker run 都没发生**（RUN_ARGS 只是数组），卡和端口原封未动。
+if [ "$PREPARE_ONLY" = "1" ]; then
+  echo "[start] PREPARE_ONLY=1 完成：$SRC_DIR"
+  echo "[start]   .patches-applied 前两行：$(sed -n '1p;2p' "$SRC_DIR/.patches-applied" | tr '\n' ' ')"
+  echo "[start]   镜像：$IMAGE（$(image_identity)）"
+  echo "[start]   树内 series 指纹与镜像 Id 已校验；gate 定义齐全；PGO 落点 ${PGO_DEST_EFF:-未启用}"
+  echo "[start]   未启动容器。要起服：去掉 PREPARE_ONLY（会停/抢 8 卡，先确认没有别的服务在跑）"
   exit 0
 fi
 

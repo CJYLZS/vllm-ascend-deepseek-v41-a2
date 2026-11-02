@@ -1,5 +1,9 @@
 # 起服脚本的运行期产物（start-server.sh 生成）
+# 树产物**按基座分家**（base.conf 的 BASE_TREE_DIR）：tree/ = rc2 基座，
+# tree-v0300/ = v0.30.0 基座，将来还会有 tree-v0310/ … 所以用通配，
+# 别再逐个加 —— 漏加一个就会把 1 GB 的树提交进 git。
 /tree/
+/tree-*/
 /runtime/
 
 # 通用
