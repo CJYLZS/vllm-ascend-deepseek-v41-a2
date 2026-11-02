@@ -6,9 +6,10 @@
 基线：`vllm-ascend v0.30.0`（`c09d3e20b`）、`vllm v0.30.0`（`ced6857`）、
 CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
 
-> **分支 = 基座**。`main`/`v1`/`v2` 挂 `v0.30.0rc2`（`8fde6d4e3`，树 `tree/`，
-> PGO `pgo/optim/pgo/`）；本分支 `v0300` 挂 `v0.30.0`（`c09d3e20b`，树 `tree-v0300/`，
-> PGO `pgo/optim/pgo-3.12.16/`）。两个基座的产物并存、互不覆盖。
+> **分支 = 基座**。`main`/`v1`/`v2` 挂 `v0.30.0rc2`（`8fde6d4e3`，树目录 `tree/`，
+> PGO 产物在仓库外的 `rc2/pgo/optim/pgo/`）；本分支 `v0300` 挂 `v0.30.0`（`c09d3e20b`，
+> 树目录 `tree-v0300/`，PGO 在仓库外的 `rc2/pgo/optim/pgo-3.12.16/`）。
+> 两个基座的产物并存、互不覆盖。树目录名与 PGO 相对路径都由 `base.conf` 给出。
 > 基座身份唯一来源 = `base.conf`；三个起服入口都从它取值，**不要在别处写死镜像名
 > 或 python 版本号**（写死 python 版本会让 PGO 静默失效，见 §5.1）。
 
@@ -40,6 +41,11 @@ CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
    - **唯一的例外是"实测数据"表**。表格里可以同时存在不同基座/不同配置的数字行，
      因为那些数字就是用来做**当前与过去对比**的。但每条数字必须标注清楚它属于哪个
      基座/配置，不能让人误以为是当前档位的读数。
+   - **README 里只写本仓库里真实存在的路径**。`tree*/` 与 PGO `.so` 都是
+     `.gitignore` 排除的运行期/编译产物，**不在仓库里**：树直接不提；PGO 只说
+     "取自哪个上游 release + asset + sha256"，不写仓库内的相对路径。
+     （`base.conf` 里的 `BASE_TREE_DIR` / `BASE_PGO_SO_REL` 是**配置值**，可以有；
+      README 不该把它们的值当成本仓库的目录结构来展示。）
 
    ⚠ 这条规则的代价：README 不再告诉你"为什么现在是这样"。补那个信息的是
    `AGENTS.md §5 已知坑与历史事故` 和 `rc2/docs/` —— 想知道前因后果去那里，
@@ -62,11 +68,15 @@ CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
 | `vllm.patch` | vllm 侧补丁（1 文件，prompt 编码两个缺陷） |
 | `tests/` | 回归用例（见 §2.3） |
 | `legacy/` | 旧的单个大补丁 `vllm-ascend.monolithic.patch`（796 行），**仅供回退**，正常流程不读 |
-| `tree/` | ← 运行期产物，`.gitignore` 排除。从镜像里取出的源码树 + 打完补丁的结果 |
+| `tree/`、`tree-v0300/` | ← 运行期产物，`.gitignore` 排除。从镜像里取出的源码树 + 打完补丁的结果，目录名由 `base.conf` 的 `BASE_TREE_DIR` 按基座分家 |
 | `runtime/` | ← 运行期产物，`.gitignore` 排除。日志/plog/npulog/编译缓存，按 `<hostname>/<NAME>` 隔离 |
 
-`tree/` 和 `runtime/` **不在版本控制里**，删掉会自动重建（`tree/` 约 0.6 GB，
+`tree*/` 和 `runtime/` **不在版本控制里**，删掉会自动重建（一棵树约 0.6 GB，
 重建约 1 min）。**不要提交它们。**
+
+> **PGO 产物不在本仓库里**，放在仓库外的 `rc2/pgo/optim/`（编译产物，按 python
+> 版本分家，见 §7.1）。`base.conf` 的 `BASE_PGO_SO_REL` 以相对路径指过去。
+> 产物来源与验证记录见 `rc2/docs/PGO_31216.md`，基座对照数据见 `rc2/docs/V0300_BASELINE.md`。
 
 ### 2.2 每个 patch 的职责
 
@@ -284,8 +294,8 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 
 | 分支 | 基座 | 内容 |
 |---|---|---|
-| `v0300` | **`v0.30.0` (c09d3e20b)** | ★ **当前**。CANN 9.2.1 / python 3.12.16。树 `tree-v0300/`，PGO `pgo/optim/pgo-3.12.16/`。`0101` 退役，5 补丁 + `vllm.patch` |
-| `main` | `v0.30.0rc2` (8fde6d4e3) | rc2 基线（保留为可复现的对照臂）。补丁拆分为 `series.conf` + `patches/`，6 补丁含 `0101`；树 `tree/` |
+| `v0300` | **`v0.30.0` (c09d3e20b)** | ★ **当前**。CANN 9.2.1 / python 3.12.16。树目录 `tree-v0300/`（`BASE_TREE_DIR`），PGO 用仓库外 `rc2/pgo/optim/pgo-3.12.16/`。5 补丁 + `vllm.patch` |
+| `main` | `v0.30.0rc2` (8fde6d4e3) | rc2 基线（保留为可复现的对照臂）。补丁拆分为 `series.conf` + `patches/`，6 补丁含 `0101`；树目录 `tree/`，PGO 用仓库外 `rc2/pgo/optim/pgo/` |
 | `v1` | `v0.30.0rc2` | V1 旧版（`3d429b6`）。单文件 `vllm-ascend.patch` 1788 行，12 个 gate，`VLLM_USE_V2_MODEL_RUNNER=0` |
 | `v2` | `v0.30.0rc2` | 与 `main` 同 commit 的历史别名，保留兼容 |
 
@@ -299,7 +309,8 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
    把另一条基座的树覆盖掉，旧基座从此不可复现。所以 `base.conf` 的 `BASE_TREE_DIR`
    按分支分家（`tree/` vs `tree-v0300/`）。
 3. **PGO 产物按 python 版本分家**。3.12.13 与 3.12.16 的产物互不兼容，同一目录会互相
-   覆盖。`optim/pgo/` 与 `optim/pgo-3.12.16/` 并存。
+   覆盖。两份并存于**仓库外**的 `rc2/pgo/optim/`（`pgo/` 与 `pgo-3.12.16/`），
+   `base.conf` 的 `BASE_PGO_SO_REL` 用相对路径指过去。
 
 ---
 

@@ -386,7 +386,7 @@ if [ -n "$PGO_SO" ]; then
   if [ -n "${BASE_PGO_ARTIFACT_PYVER:-}" ] && [ -n "${BASE_PYTHON_VER:-}" ] \
      && [ "$BASE_PGO_ARTIFACT_PYVER" != "$BASE_PYTHON_VER" ]; then
     echo "[start] 注意：PGO 产物编自 python ${BASE_PGO_ARTIFACT_PYVER}，镜像自带 ${BASE_PYTHON_VER}（跨版本挂载，已实测可用）" >&2
-    echo "[start]       −3.2~5.1% 是在 ${BASE_PGO_ARTIFACT_PYVER} 上量的，新基座尚未复核。干净做法见 rc2/pgo/README.md" >&2
+    echo "[start]       −3.2~5.1% 是在 ${BASE_PGO_ARTIFACT_PYVER} 上量的，新基座尚未复核。产物来源见 base.conf 注释" >&2
   fi
 fi
 

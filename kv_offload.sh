@@ -3,8 +3,8 @@
 # kv_offload.sh —— KV 外部池（AscendStoreConnector + MemCache）的唯一实现
 #
 # 被两个入口 source，实现只有这一份：
-#   ① 本仓库的 start-server.sh      —— 自包含入口（自带 tree/，README §6/§7）
-#   ② 工作区根目录 start-server.sh  —— 挂 rc2/stable 的那条入口
+#   ① 本仓库的 start-server.sh      —— 自包含入口（源码树由本仓库生成，README §6）
+#   ② 工作区根目录 start-server.sh  —— 挂补丁仓库产物树的那条入口
 # 这样"起池"这件事只有一个实现，不会像 GPU_UTIL 那回一样两处各写一遍再漂移。
 #
 # 契约（调用方准备；模块只在缺省时兜底）：

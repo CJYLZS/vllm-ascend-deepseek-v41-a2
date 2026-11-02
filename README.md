@@ -9,13 +9,14 @@ CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `
 
 > ### ⚠ 一个分支 = 一个基座
 >
-> | 分支 | 基座镜像 | 上游 commit | 树目录 | PGO 产物 |
-> |---|---|---|---|---|
-> | **`v0300`（本分支）** | **`v0.30.0`** | **`c09d3e20b`** | **`tree-v0300/`** | **`pgo/optim/pgo-3.12.16/`（3.12.16，官方预编 PGO+LTO）** |
-> | `main` / `v1` / `v2` | `v0.30.0rc2` | `8fde6d4e3` | `tree/` | `pgo/optim/pgo/`（3.12.13，自编） |
+> | 分支 | 基座镜像 | 上游 commit | CANN | python | PGO libpython |
+> |---|---|---|---|---|---|
+> | **`v0300`（本分支）** | **`v0.30.0`** | **`c09d3e20b`** | **9.2.1** | **3.12.16** | **3.12.16 官方预编 PGO+LTO** |
+> | `main` / `v1` / `v2` | `v0.30.0rc2` | `8fde6d4e3` | 9.2.0 | 3.12.13 | 3.12.13 本机自编 |
 >
-> 各基座的树与 PGO 产物**并存、互不覆盖**，可随时 A/B 切换。
-> 换基座 = 开新分支；`base.conf` 决定挂哪个镜像、哪棵树、哪份 PGO。
+> 源码树是运行期产物（**不在本仓库里**，起服时从镜像现取）。各基座的树与 PGO 产物
+> 按基座分家、互不覆盖，可随时 A/B 切换。
+> 换基座 = 开新分支；`base.conf` 决定用哪个镜像、哪棵树、哪份 PGO。
 
 ## 实测数据
 
@@ -55,7 +56,7 @@ CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `
 
 > **两个基座每步时延无差异**：8K→512 平均 −0.22%（范围 −0.7%~+0.7%），
 > 8K→1K 平均 ±0.00%（范围 −2.0%~+2.5%），方向在协议间不一致 ⇒ 噪声。
-> 换基座是维护性升级，不是性能升级。详见 `rc2/docs/V0300_BASELINE.md`。
+> 换基座是维护性升级，不是性能升级。
 
 ## 1. 前置条件
 
@@ -96,8 +97,7 @@ cd engram_int8 && bash reassemble_engram_weights.sh
 ## 2. 快速开始
 
 ```bash
-# 镜像不必显式给：默认取 base.conf 的 BASE_IMAGE（本分支 = v0.30.0）
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.30.0
+# 镜像不必显式给：默认取 base.conf 的 BASE_IMAGE（本分支 = quay.nju.edu.cn/ascend/vllm-ascend:v0.30.0）
 export MODEL=/path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
 
 bash start-server.sh                      # 起服（首次自动准备源码树并打补丁）
@@ -185,25 +185,41 @@ vllm/vllm/_rust_tool_parser.abi3.so、vllm/vllm/vllm-rs
 ## 5. 可选：PGO 版 libpython
 
 默认已开。产物路径取自 `base.conf` 的 `BASE_PGO_SO_REL`，**挂载落点由
-`base.sh` 的 `base_pgo_dest` 从镜像里探测**（起 0.7 s 一次性容器读 `sysconfig.LIBDIR`）：
+`base.sh` 的 `base_pgo_dest` 从镜像里探测**（起 0.7 s 一次性容器读 `sysconfig.LIBDIR`）。
+
+> ⚠ **PGO 产物不在本仓库里**（编译产物，按 python 版本分家、放在仓库外），需自备。
+> `BASE_PGO_SO_REL` 用相对路径指过去，指到不存在的文件时起服直接 FATAL（`exit 1`）。
 
 ```bash
-# 默认：base.conf 指到 pgo/optim/pgo-3.12.16/libpython3.12.so.1.0（3.12.16 预编 PGO+LTO）
+# 默认：用 base.conf 里 BASE_PGO_SO_REL 指的那份（本分支 = 3.12.16 官方预编 PGO+LTO）
 # 覆盖：PGO_SO=/path/to/libpython3.12.so.1.0 bash start-server.sh
 # 关掉：PGO=0 bash start-server.sh
 ```
 
-| 基座 | 产物 | 来源 |
-|---|---|---|
-| `v0.30.0rc2`（main） | `pgo/optim/pgo/` | 本机自编，python 3.12.13，md5 `68cfbe78…` |
-| **`v0.30.0`（本分支）** | **`pgo/optim/pgo-3.12.16/`** | **官方预编译，python 3.12.16，md5 `72675e2b…`** |
+| 基座 | PGO 产物来源 |
+|---|---|
+| `v0.30.0rc2`（main） | 本机自编（python 3.12.13），md5 `68cfbe78…` |
+| **`v0.30.0`（本分支）** | **官方预编译（python 3.12.16），md5 `72675e2b…`** |
+
+本分支那份来自 `astral-sh/python-build-standalone`：
+
+```
+asset   cpython-3.12.16+20261026-aarch64-unknown-linux-gnu-install_only.tar.gz
+sha256  a945427411dc6851a1393533b74a4a1ac434321ae397f2ec69897a9b4fde032b
+url     https://github.com/astral-sh/python-build-standalone/releases/download/20261026/
+        cpython-3.12.16+20261026-aarch64-unknown-linux-gnu-install_only.tar.gz
+```
+
+它是**货真价实的 PGO+LTO**（`--enable-optimizations --with-lto=full PROFILE_TASK=-m test --pgo`），
+版本与镜像 `3.12.16` 精确一致。解包后取里面的 `libpython3.12.so.1.0` 使用
+（`sha256` 不符别用）。`main` 分支那份由本机脚本现编，耗时约 1322 s。
 
 - `rc2` 基座的 3.12.13 产物：实测每步 decode 时延 **−3.2~5.1%**（均值 −4.27%，6 档全降）。
 - 本分支的 3.12.16 产物：**增益尚未实测**，需做 PGO on/off 同协议对照。
 - ⚠ **落点必须探测，不能写死版本号**：路径里的 python 次版本与镜像不符时，
   docker 会自动建一个空目录、挂载"成功"、解释器按 DT_RPATH 加载镜像自带的库
   ⇒ PGO 完全失效，而 `docker inspect` / 启动日志 / `sys.version` 全都看不出异常。
-  `PGO_DEST=` 可显式覆盖；验证记录见 `rc2/docs/PGO_31216.md`。
+  `PGO_DEST=` 可显式覆盖。
 
 > PGO 收益只看**每步时延**。吞吐会被 `A_spec` 抽签噪声盖住，跨进程比吞吐会得出相反结论。
 
@@ -247,7 +263,7 @@ MetaService 容器名 `<NAME>-mmc-meta`，不占卡。已存在时校验端口�
 FATAL: KV_OFFLOAD=1 但源码树不含 KV 池的 MRV2 抢占恢复修复
 ```
 
-判据是"那行代码在不在"，不关心由谁提供：本仓库的树（`v0.30.0` 基座）由上游代码满足。
+判据是"那行代码在不在"，不关心由谁提供：`v0.30.0` 基座的树由上游代码满足。
 真要不带修复跑：
 
 ```bash
@@ -366,7 +382,7 @@ logs / plog / npulog / 编译缓存落在 `$LOG_DIR`（默认 `./runtime/<hostna
 **开新分支，不要原地改。** 一个分支 = 一个基座。
 
 ```bash
-cd rc2/patches/vllm-ascend-deepseek-v41-a2
+cd vllm-ascend-deepseek-v41-a2        # 本仓库根目录
 git checkout -b v0310 main          # 从 main 或上一个基座分支拉
 
 # 1) 只改 base.conf：镜像名 / 镜像 Id / 上游 commit / CANN / python / triton / 树目录
@@ -394,7 +410,7 @@ DRY_RUN=1 bash start-server.sh
 - [ ] `BASE_TREE_DIR` 换了新名字（否则切分支会原地覆盖另一条基座的树）
 - [ ] `BASE_PGO_SO_REL` 指向与镜像 python 版本**匹配**的 PGO 产物
 - [ ] `series.conf` 里没有上游已自带的补丁（否则 `git apply` 会失败）
-- [ ] `tree-*/` 里的 `.patches-applied` 第 3 行 = 本次镜像 Id
+- [ ] 建成后源码树里 `.patches-applied` 的第 3 行 = 本次镜像 Id
 - [ ] 本 README 的实测数据表标注清楚基座，新基座的表重测后补齐
 
 ## 12. 补丁清单
