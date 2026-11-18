@@ -387,8 +387,11 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
   6 个 gate 全传进容器、`aivMode[1]` **8/8 rank**、jemalloc 无 preload 告警、
   PGO 自证行 1 条、KV 池 `rank 登记 8/8`、KV 容量 **3,489,673 tokens**（`max_len=524288`）、
   冒烟三项全对。上游新增的 `@support_torch_compile` / `decoder_replay` **没有改变图捕获数量**。
-  **仍未验证**：6 个 gate 与 PGO 在这个基座上的**实际收益**、两套协议的**每步时延**
-  —— 要谈数字先按 README §11 测。
+  **每步时延已测**（2026-11-18，5 reps，当前配置 `max_len=524288` + 池 16 GB/rank）：
+  8K→512 c=1/4/5/8/9/13 = **27.39 / 36.49 / 37.90 / 42.03 / 44.21 / 49.34 ms**；
+  8K→1K c=1/4/8/16 = **27.83 / 36.52 / 42.63 / 51.22 ms**。相对 `v0.30.0`（**旧配置**）
+  分别 **+0.79% / +1.59%** —— 基座与配置同时变了，**不能归因给基座**。
+  仍未验证：6 个 gate 与 PGO 在这个基座上的**实际收益**（要同基座 on/off 对照）。
 - **`TRITON_ASCEND_ARCH` 在 0.32 的 triton 里已弃用**（每次起服 8 行
   `FutureWarning: ... is deprecated ... host environment overrides are ignored`）。
   `serve.sh` 仍在传它，但**已被忽略**（arch 由设备决定）。无害，但别再指望它生效。
