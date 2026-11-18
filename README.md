@@ -2,16 +2,17 @@
 
 在 **8 × Ascend 910B3（A2）** 单机上服务
 [`DeepSeek-V4.1-Flash-1017-w4a8-Ascend`](https://www.modelscope.cn/models/chiro2001/DeepSeek-V4.1-Flash-1017-w4a8-Ascend)，
-基于官方 **vllm-ascend v0.30.0**，默认启用 **Model Runner V2**。
+基于官方 **vllm-ascend v0.32.0rc1**，默认启用 **Model Runner V2**。
 
-基线：`vllm-ascend v0.30.0`（`c09d3e20b`）、`vllm v0.30.0`（`ced6857`）、
+基线：`vllm-ascend v0.32.0rc1`（`24487f4f4`）、`vllm v0.32.0`（`5df63a7203`）、
 CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `base.conf`。**
 
 > ### ⚠ 一个分支 = 一个基座
 >
 > | 分支 | 基座镜像 | 上游 commit | CANN | python | PGO libpython |
 > |---|---|---|---|---|---|
-> | **`v0300`（本分支）** | **`v0.30.0`** | **`c09d3e20b`** | **9.2.1** | **3.12.16** | **3.12.16 官方预编 PGO+LTO** |
+> | **`v0320`（本分支）** | **`v0.32.0rc1`** | **`24487f4f4`** | **9.2.1** | **3.12.16** | **3.12.16 官方预编 PGO+LTO** |
+> | `v0300` | `v0.30.0` | `c09d3e20b` | 9.2.1 | 3.12.16 | 3.12.16 官方预编 PGO+LTO |
 > | `main` / `v1` / `v2` | `v0.30.0rc2` | `8fde6d4e3` | 9.2.0 | 3.12.13 | 3.12.13 本机自编 |
 >
 > 源码树是运行期产物（**不在本仓库里**，起服时从镜像现取）。各基座的树与 PGO 产物
@@ -20,11 +21,15 @@ CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `
 
 ## 实测数据
 
+> ⚠ **本分支（`v0320` = `v0.32.0rc1` 基座）尚未起服实测。** 下文所有数字都属于
+> **`v0.30.0` 基座**，保留在此只作移植前的对照基线，**不可当作本基座的读数**；
+> 本基座读数补测后按同一格式另起新行。
+
 单机 8 × 910B3（A2），TP8/EP8，temperature=0。测的是**默认档**
 （V2 runner + 6 个 gate + 共享专家多流 + PGO + `HCCL_OP_EXPANSION_MODE=AIV`
 + `0005` 槽位映射标量化，挂 2 GB/rank KV 外部池）。
 
-> 每行都标注所属基座：**`v0.30.0` = 本分支（`v0300`）**，`v0.30.0rc2` = `main` 分支。
+> 每行都标注所属基座：`v0.30.0` = `v0300` 分支，`v0.30.0rc2` = `main` 分支。
 > 两套协议（512 / 1024）不可跨表比。判据只用**每步 `itl_ms`**，
 > 不要用 `wall_ms_per_engine_output` —— 后者含 prefill 与 drain，会得出相反结论。
 
@@ -51,7 +56,7 @@ CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `
 | 聚合吞吐 (tok/s) — `v0.30.0` | 158.0 | 341.6 | 649.5 | 980.8 |
 | A_spec — `v0.30.0` | 4.59 | 3.64 | 4.22 | 3.93 |
 
-**KV 容量**：3,628,926 tokens（`v0.30.0`）／3,629,044（`v0.30.0rc2`）。
+**KV 容量**：3,628,926 tokens（`v0.30.0`）／3,629,044（`v0.30.0rc2`）／`v0.32.0rc1` **待测**。
 同一配置重启在 ±128 内浮动（按 `block_size=128` 取整分配），不是参数变化。
 
 > **两个基座每步时延无差异**：8K→512 平均 −0.22%（范围 −0.7%~+0.7%），
@@ -65,7 +70,7 @@ CANN `9.2.1`、python `3.12.16`。**基座身份的唯一来源是本目录的 `
 | 硬件 | 单机 8 × 910B3（A2），每卡 HBM 65536 MB |
 | OS / 架构 | Linux `aarch64` |
 | 驱动 | 25.5.6 |
-| 镜像 | **`vllm-ascend:v0.30.0`**（本分支；`main` 分支是 `v0.30.0rc2`）—— 取值见 `base.conf` |
+| 镜像 | **`vllm-ascend:v0.32.0rc1`**（本分支；另有 `v0300` = `v0.30.0`、`main` = `v0.30.0rc2`）—— 取值见 `base.conf` |
 | 权重 | 见 §1.1 |
 | 其他 | `docker`、`tar`，`git` 或 `patch` 之一 |
 
@@ -97,7 +102,7 @@ cd engram_int8 && bash reassemble_engram_weights.sh
 ## 2. 快速开始
 
 ```bash
-# 镜像不必显式给：默认取 base.conf 的 BASE_IMAGE（本分支 = quay.nju.edu.cn/ascend/vllm-ascend:v0.30.0）
+# 镜像不必显式给：默认取 base.conf 的 BASE_IMAGE（本分支 = quay.nju.edu.cn/ascend/vllm-ascend:v0.32.0rc1）
 export MODEL=/path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
 
 bash start-server.sh                      # 起服（首次自动准备源码树并打补丁）
@@ -199,7 +204,7 @@ vllm/vllm/_rust_tool_parser.abi3.so、vllm/vllm/vllm-rs
 | 基座 | PGO 产物来源 |
 |---|---|
 | `v0.30.0rc2`（main） | 本机自编（python 3.12.13），md5 `68cfbe78…` |
-| **`v0.30.0`（本分支）** | **官方预编译（python 3.12.16），md5 `72675e2b…`** |
+| **`v0.30.0`（v0300）/ `v0.32.0rc1`（本分支）** | **官方预编译（python 3.12.16），md5 `72675e2b…`** |
 
 本分支那份来自 `astral-sh/python-build-standalone`：
 
@@ -365,9 +370,11 @@ logs / plog / npulog / 编译缓存落在 `$LOG_DIR`（默认 `./runtime/<hostna
 
 - **不要用 `vllm_ascend/_version.py` 判断实际跑的代码**：它由构建期生成，本补丁没重新生成，
   报的仍是镜像构建期那版。要看真实状态用
-  `git -C $SRC_DIR/vllm-ascend log --oneline -1`（本分支应为 `c09d3e20b`）。
-- 补丁针对 `v0.30.0`（`c09d3e20b`）原样应用，`series.conf` 里 5 个补丁全部干净通过。
+  `git -C $SRC_DIR/vllm-ascend log --oneline -1`（本分支应为 `24487f4f4`）。
+- 补丁针对 `v0.32.0rc1`（`24487f4f4`）重做后应用，`series.conf` 里 5 个补丁全部干净通过。
   镜像里 `/vllm-workspace` 的树被改过则 `git apply` 失败，脚本立刻报错，不会静默。
+- `0001` 自带 `_v41_binary_env()`，**不依赖上游的 `_strict_binary_env`**（上游已删该函数），
+  换基座时上游怎么改 `envs.py` 都不会让 6 个 gate 静默失效。
 - 只验证过 8 卡 TP8/EP8 单机，改 `TP` 未测。
 - Model Runner V2 在 vllm-ascend 侧标注 `[Experimental]`；官方 DeepSeek-V4 + dspark 的 e2e
   覆盖的是 A3，A2 无官方覆盖。

@@ -1,5 +1,5 @@
 diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
-index 841de385cb61a435c09997e151083d655cce4e87..c20034ec6efdc51b17db923b5715c124a358957c 100644
+index 6851d42..09b7a1e 100644
 --- a/vllm/tokenizers/deepseek_v41_encoding.py
 +++ b/vllm/tokenizers/deepseek_v41_encoding.py
 @@ -168,6 +168,73 @@ def sort_tool_results_by_call_order(

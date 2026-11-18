@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
-index 8cd11c8c1..b675a53ef 100644
+index 2f7c9c6..babe534 100644
 --- a/vllm_ascend/attention/dsa_v41.py
 +++ b/vllm_ascend/attention/dsa_v41.py
 @@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
@@ -10,7 +10,7 @@ index 8cd11c8c1..b675a53ef 100644
  from vllm_ascend.ascend_config import get_ascend_config
  from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
  from vllm_ascend.core.kv_cache_interface import (
-@@ -606,7 +607,7 @@ class AscendDSAV41Impl:
+@@ -657,7 +658,7 @@ class AscendDSAV41Impl:
              shared.topk_indices[: selected.shape[0]].fill_(-1)
          elif not getattr(attn, "uses_a5_packed_cache", False):
              shared.topk_indices[: selected.shape[0]].copy_(selected)
@@ -19,7 +19,7 @@ index 8cd11c8c1..b675a53ef 100644
              shared.candidates[: candidates.shape[0]].copy_(candidates)
          return shared.topk_indices[: hidden_states.shape[0]]
  
-@@ -762,6 +763,12 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -836,6 +837,12 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
              raise TypeError(f"Unsupported V4.1 cache spec: {type(kv_cache_spec).__name__}")
          self._device_backend = DeviceOperator.get_dsv41_packed_cache_ops()
          self._uses_a5_packed_cache = self._device_backend is not None
@@ -32,7 +32,7 @@ index 8cd11c8c1..b675a53ef 100644
          text_config = vllm_config.model_config.hf_text_config
          window_size = int(_config_value(text_config, "sliding_window", 0))
          query_metadata_size = V41_METADATA_BUFFER_SIZE if build_query_metadata else 0
-@@ -811,12 +818,54 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -885,12 +892,54 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
              if name.endswith(".compressor.state_cache")
          )
          self._c2_full_source_rope: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -87,7 +87,7 @@ index 8cd11c8c1..b675a53ef 100644
      @classmethod
      def get_cudagraph_support(
          cls,
-@@ -977,17 +1026,67 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1051,17 +1100,67 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
              slots = self._slot_mapping[:num_input_tokens]
              flat_slots = None
          else:
@@ -162,7 +162,7 @@ index 8cd11c8c1..b675a53ef 100644
                      assert self._device_backend is not None
                      prepared_slots, prepared_flat_slots = self._device_backend.build_packed_cache_slot_mapping(
                          active_slots,
-@@ -998,36 +1097,65 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1072,36 +1171,65 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                          num_actual_tokens,
                          storage_block_size,
                          ratio if compressed else 1,
@@ -250,12 +250,29 @@ index 8cd11c8c1..b675a53ef 100644
                  shared[slot_key] = prepared_slots
                  shared[flat_slot_key] = prepared_flat_slots
              slots = prepared_slots
-@@ -1057,15 +1185,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1131,28 +1259,20 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                  rope = get_cos_and_sin_dsa(positions, use_cache=(coordinates["num_prefills"] == 0 or full_graph_mode))
                  batch_shared["rope"] = rope
              cos, sin = rope
 -        text_config = self.vllm_config.model_config.hf_text_config
 -        window_size = int(_config_value(text_config, "sliding_window", 0))
++        text_config = self._text_config
++        window_size = self._const_window_size
+         if cache_kind == "swa":
+-            # The window the mask floors on (this one) and the window the replay
+-            # padding writes out (the spec's, through ``prefix_replay_tokens``)
+-            # have to be the same number: the padding decides which slots the
+-            # replayed tokens skip, and the floor decides which positions they can
+-            # see. A drift between the two sources -- the text config here, the
+-            # cache spec there -- pads one window and bounds another, which is a
+-            # silent precision loss rather than a failure, so it is checked.
++            # Upstream asserts the mask floor and the replay padding agree on
++            # the window; keep it verbatim, only the value source is cached.
+             spec_window = int(getattr(spec, "sliding_window", window_size))
+             assert spec_window == window_size, (
+                 "SWA bounded replay pads the spec's sliding_window "
+                 f"({spec_window}) while the mask floors on the text config's ({window_size})."
+             )
 -        n_local_heads = (
 -            int(_config_value(text_config, "num_attention_heads"))
 -            // self.vllm_config.parallel_config.tensor_parallel_size
@@ -263,15 +280,14 @@ index 8cd11c8c1..b675a53ef 100644
 -        n_local_heads = int(kwargs.get("num_query_heads", n_local_heads))
 -        head_dim = int(_config_value(text_config, "head_dim"))
 -        index_topk = int(_config_value(text_config, "index_topk"))
-+        text_config = self._text_config
-+        window_size = self._const_window_size
++        assert text_config is not None
 +        n_local_heads = int(kwargs.get("num_query_heads", self._n_local_heads()))
 +        head_dim = self._index_const("head_dim")
 +        index_topk = self._index_const("index_topk")
          ori_sparse_indices = kwargs.get("ori_sparse_indices")
          ori_topk_length = None
-         noncausal = not bool(getattr(common, "causal", True))
-@@ -1236,9 +1360,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+         replay_start = kwargs.get("replay_start")
+@@ -1373,9 +1493,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                          batch_size=num_reqs,
                          max_seqlen_q=-1,
                          max_seqlen_k=-1,
@@ -283,7 +299,7 @@ index 8cd11c8c1..b675a53ef 100644
                          topk=index_topk,
                          mask_mode=3,
                          cmp_ratio=ratio,
-@@ -1252,9 +1376,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1389,9 +1509,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
  
                  def build_qli_metadata() -> None:
                      value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
@@ -295,7 +311,7 @@ index 8cd11c8c1..b675a53ef 100644
                          index_topk,
                          2,
                          cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-@@ -1327,26 +1451,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+@@ -1464,26 +1584,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                  query_lens = ends - starts
                  live = torch.arange(num_reqs, device=starts.device) < num_actual_reqs
                  used = (ends.clamp_max(num_actual_tokens) - starts).clamp_min(0)

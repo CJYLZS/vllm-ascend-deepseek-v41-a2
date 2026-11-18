@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/ops/triton/packed_cache_slot_mapping.py b/vllm_ascend/ops/triton/packed_cache_slot_mapping.py
-index 0478e4506..0c4f4bea3 100644
+index 0478e45..0c4f4be 100644
 --- a/vllm_ascend/ops/triton/packed_cache_slot_mapping.py
 +++ b/vllm_ascend/ops/triton/packed_cache_slot_mapping.py
 @@ -8,6 +8,10 @@ import torch

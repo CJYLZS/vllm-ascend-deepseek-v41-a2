@@ -3,13 +3,14 @@
 面向接手本仓库的**人或 AI agent**。README 讲「怎么部署」，本文讲「这个仓库内部
 长什么样、改东西时踩哪些坑」。**动手前先读 §1 和 §5。**
 
-基线：`vllm-ascend v0.30.0`（`c09d3e20b`）、`vllm v0.30.0`（`ced6857`）、
+基线：`vllm-ascend v0.32.0rc1`（`24487f4f4`）、`vllm v0.32.0`（`5df63a7203`）、
 CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
 
 > **分支 = 基座**。`main`/`v1`/`v2` 挂 `v0.30.0rc2`（`8fde6d4e3`，树目录 `tree/`，
-> PGO 产物在仓库外的 `rc2/pgo/optim/pgo/`）；本分支 `v0300` 挂 `v0.30.0`（`c09d3e20b`，
-> 树目录 `tree-v0300/`，PGO 在仓库外的 `rc2/pgo/optim/pgo-3.12.16/`）。
-> 两个基座的产物并存、互不覆盖。树目录名与 PGO 相对路径都由 `base.conf` 给出。
+> PGO 产物在仓库外的 `rc2/pgo/optim/pgo/`）；`v0300` 挂 `v0.30.0`（`c09d3e20b`，
+> 树目录 `tree-v0300/`）；本分支 `v0320` 挂 `v0.32.0rc1`（`24487f4f4`，树目录 `tree-v0320/`）。
+> `v0300` 与本分支的 PGO 都在仓库外的 `rc2/pgo/optim/pgo-3.12.16/`（两个基座 python 同为 3.12.16）。
+> 三个基座的产物并存、互不覆盖。树目录名与 PGO 相对路径都由 `base.conf` 给出。
 > 基座身份唯一来源 = `base.conf`；三个起服入口都从它取值，**不要在别处写死镜像名
 > 或 python 版本号**（写死 python 版本会让 PGO 静默失效，见 §5.1）。
 
@@ -68,7 +69,7 @@ CANN `9.2.1`、python `3.12.16`。默认启用 Model Runner V2。
 | `vllm.patch` | vllm 侧补丁（1 文件，prompt 编码两个缺陷） |
 | `tests/` | 回归用例（见 §2.3） |
 | `legacy/` | 旧的单个大补丁 `vllm-ascend.monolithic.patch`（796 行），**仅供回退**，正常流程不读 |
-| `tree/`、`tree-v0300/` | ← 运行期产物，`.gitignore` 排除。从镜像里取出的源码树 + 打完补丁的结果，目录名由 `base.conf` 的 `BASE_TREE_DIR` 按基座分家 |
+| `tree/`、`tree-v0300/`、`tree-v0320/` | ← 运行期产物，`.gitignore` 排除。从镜像里取出的源码树 + 打完补丁的结果，目录名由 `base.conf` 的 `BASE_TREE_DIR` 按基座分家 |
 | `runtime/` | ← 运行期产物，`.gitignore` 排除。日志/plog/npulog/编译缓存，按 `<hostname>/<NAME>` 隔离 |
 
 `tree*/` 和 `runtime/` **不在版本控制里**，删掉会自动重建（一棵树约 0.6 GB，
@@ -127,8 +128,45 @@ mock 依赖，或者按 `b27a32d` 提交里记录的方式，把它拷进 vllm-a
 结论：**12 个补丁目标文件里 10 个逐字节未变**，只有 `dsa_v1.py` 有无关重构、
 `pool_scheduler.py` 吸收了 `0101`。所以本轮升级成本极低（5 个 0xxx 全部干净应用）。
 
-下一次升级到新基线时，照 `README.md` §11 的流程走：改 `base.conf` → 逐补丁
-`git apply --check` → `PREPARE_ONLY=1` 建树 → `DRY_RUN=1` 校验命令。
+#### 2.4.1 v0.30.0(9.2.0) → v0.32.0rc1：700 提交
+
+2026-11-18 逐文件比对两个镜像得出（非估算）。**工具链没动**（CANN 9.2.1、python 3.12.16、
+triton-ascend 3.6.0.post2 全同），但上游代码动得多：
+
+| 文件 | 上游 churn | 处理 |
+|---|---|---|
+| `envs.py` | +0/−13 | **删掉了 `_strict_binary_env()` 与两个旧条目（正是 `0001` 的上下文锚点）** ⇒ `0001` 改为自带 `_v41_binary_env()` |
+| `attention/dsa_v41.py` | +146/−6 | 新增 SWA bounded-replay 断言，位置与 `0002` 改写的那段配置查询重叠 ⇒ 人工合并（缓存值 + 保留断言） |
+| `attention/dsa_v1.py` | +1170/−469 | 新增整套 OTP（o-proj TP）；`0003` 只是插入点撞车 ⇒ 两个方法都留 |
+| `models/deepseek_v41/model.py` | +49/−21 | `enable_dsa_cp` 下线、加 `@support_torch_compile`、`OProjBufferPool`、`decoder_replay_layers`；自动合并 |
+| `models/deepseek_v41/indexer.py` | +12/−2 | 新增 JIT warmup 注册；自动合并 |
+| `ops/fused_moe/token_dispatcher.py` | +35/−8 | 新增 MX quant `CEIL` 路径；自动合并 |
+| `packed_cache_slot_mapping.py` / `engram/layer.py` / `rope_dsv4.py` | 0 | 逐字节相同，`0005` / `0004` 原样可打 |
+| `pool_scheduler.py` | +120/−372 | `0101` 的修复仍在（新树 `:555` 且注释写明 MRV2 resume）⇒ 继续退役，`kv_offload.sh` 闸门不用改 |
+| `vllm/tokenizers/deepseek_v41_encoding.py` | +2/−2 | `REASONING_EFFORT_MAPPINGS` 里 `low` 25→50、`high` 50→75；`vllm.patch` 照常应用 |
+
+两处**新的**、跨基座通用的事故形态（已修，见 §5「历史事故」）：
+
+1. 上游把我们**踩着的辅助函数**删了 —— 补丁的 lambda 懒求值 ⇒ 不 import 失败，只在
+   第一次读 gate 时 `NameError`。教训：**自己依赖的辅助函数要自己带**。
+2. 上游删了运行期产物 `vllm/vllm/_rust_tool_parser.abi3.so`（0.32 起只有 `vllm-rs`），
+   而 `start-server.sh` 把它写成必需项 ⇒ 建树阶段误报"缺构建产物"。教训：
+   **产物校验要跨基座成立**（现在只硬校验两者都在的 `vllm-rs`）。
+
+⚠ **判断"要重做多少"不要用 `git apply --check`**：本轮它对 6 个补丁报 5 个失败，
+但三路复演（把我们的改动当一次提交 rebase 到新基座）显示**只有 3 个文件真冲突**，
+其余全是上下文漂移假象。流程改为：
+
+```bash
+# 三路复演：base30 → ours → base32，然后把 ours rebase 到 base32
+git init -q -b main . && cp -a <旧基座目标文件> . && git commit -m base30 && git tag base30
+<应用现有补丁> && git commit -m ours && git tag ours
+git checkout base30 && cp -a <新基座同名文件> . && git commit -m base32 && git tag base32
+git checkout -b replay ours && git rebase base32     # ← 冲突数才是真实工量
+```
+
+之后照 `README.md` §11 的流程走：改 `base.conf` → 上述复演重做补丁 →
+`PREPARE_ONLY=1` 建树 → `DRY_RUN=1` 校验命令 → 起服。
 
 ---
 
@@ -265,6 +303,22 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
   探测失败会显式告警而不是静默挂空目录。`PGO_DEST=` 仍可显式覆盖。
   > 教训：凡"宿主机路径 → 容器内路径"的挂载，只要容器内路径带版本号，
   > 就必须探测、不能写死。同类还有 `--entrypoint` 的绝对路径、`LD_PRELOAD` 的库名。
+- **补丁依赖上游辅助函数 ⇒ 上游删掉后 gate 静默变 0**（v0320 升级时发现）：
+  `0001` 的 6 个 gate 都写 `lambda: _strict_binary_env(...)`，而 `_strict_binary_env`
+  是**上游 `envs.py` 里的函数**。v0.32.0rc1 把它连同两个旧条目一起删了。
+  由于 lambda 是懒求值，`import` 不报错、服务照常起、`docker exec env | grep` 也看得到
+  变量 —— 只有在**第一次读某个 gate** 时抛 `NameError`，或者（更糟）被调用方吞掉后
+  走默认关路径。
+  现改为补丁自带 `_v41_binary_env()`（自己的代码，上游怎么改都不影响）。
+  > 教训：补丁里**不要借上游的内部辅助函数**，宁可复制一份 8 行的。判据：这个符号上游
+  > 没在公开 API 里承诺过，就不要依赖它。
+- **运行期产物清单写死 ⇒ 新基座误报"缺构建产物"**（v0320 升级时发现）：
+  `start-server.sh` 曾硬校验 `vllm/vllm/_rust_tool_parser.abi3.so`。v0.32.0rc1 起上游
+  **删掉了这个 Python 扩展**（全树无任何 import 引用，`tools/build_rust.py` 里只剩一行
+  注释），只留 `vllm-rs` 可执行文件 ⇒ 建树成功后立刻 `FATAL: 缺构建产物`。
+  现改为硬校验三个基座都有的那几件（两个 vllm-ascend `.so` + `vllm-rs`）。
+  > 教训：这类"从镜像里取出的产物"清单会随基座变。新增校验时先问一句
+  > "这个东西在**所有**在用基座里都存在吗"，否则它就是把换基座变成一次故障。
 
 ---
 
@@ -294,7 +348,8 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
 
 | 分支 | 基座 | 内容 |
 |---|---|---|
-| `v0300` | **`v0.30.0` (c09d3e20b)** | ★ **当前**。CANN 9.2.1 / python 3.12.16。树目录 `tree-v0300/`（`BASE_TREE_DIR`），PGO 用仓库外 `rc2/pgo/optim/pgo-3.12.16/`。5 补丁 + `vllm.patch` |
+| `v0320` | **`v0.32.0rc1` (24487f4f4)** | ★ **当前**。CANN 9.2.1 / python 3.12.16 / triton 3.6.0.post2。树目录 `tree-v0320/`（`BASE_TREE_DIR`），PGO 用仓库外 `rc2/pgo/optim/pgo-3.12.16/`。5 补丁 + `vllm.patch`（已按新基座重做）。**尚未起服实测** |
+| `v0300` | `v0.30.0` (c09d3e20b) | 上一轮基座，保留为可复现的对照臂。树目录 `tree-v0300/`，PGO 同上。5 补丁 + `vllm.patch` |
 | `main` | `v0.30.0rc2` (8fde6d4e3) | rc2 基线（保留为可复现的对照臂）。补丁拆分为 `series.conf` + `patches/`，6 补丁含 `0101`；树目录 `tree/`，PGO 用仓库外 `rc2/pgo/optim/pgo/` |
 | `v1` | `v0.30.0rc2` | V1 旧版（`3d429b6`）。单文件 `vllm-ascend.patch` 1788 行，12 个 gate，`VLLM_USE_V2_MODEL_RUNNER=0` |
 | `v2` | `v0.30.0rc2` | 与 `main` 同 commit 的历史别名，保留兼容 |
@@ -307,7 +362,7 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
    同一张表里，读的人无法分辨哪些还成立 —— 那是"看起来有效、其实换了底"的假数据。
 2. **`tree/` 是 gitignored 单份产物**。两分支共用 `tree/` 时，切分支就会原地重建、
    把另一条基座的树覆盖掉，旧基座从此不可复现。所以 `base.conf` 的 `BASE_TREE_DIR`
-   按分支分家（`tree/` vs `tree-v0300/`）。
+   按分支分家（`tree/` / `tree-v0300/` / `tree-v0320/`）。
 3. **PGO 产物按 python 版本分家**。3.12.13 与 3.12.16 的产物互不兼容，同一目录会互相
    覆盖。两份并存于**仓库外**的 `rc2/pgo/optim/`（`pgo/` 与 `pgo-3.12.16/`），
    `base.conf` 的 `BASE_PGO_SO_REL` 用相对路径指过去。
@@ -327,7 +382,11 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
   实测没触发（3 个 8-rank 域下全局开也正常），但别的拓扑别照抄这个结论。
 - **AIV 会让 KV 容量少约 12k token**（3.64M → 3.63M，可用 KV 15.61 → 15.55 GiB）。
   只观测到一次，没做隔离变量；仍 3.46x 并发，不影响可用性。
+- **`v0320`（`v0.32.0rc1`）只做到「树建好 + 补丁干净应用 + 语法编译通过」**：
+  还没起过服。以下都没验证：图捕获数量（上游给模型类加了 `@support_torch_compile`）、
+  READY 时长、6 个 gate 的实际收益、PGO 在 3.12.16 上的增益、两套协议的每步时延。
+  起服后先按 README §11 的自证清单逐条确认，再谈数字。
 - 不要用 `vllm_ascend/_version.py` 判断实际跑的代码 —— 它由构建期生成，本补丁没
-  重新生成，仍报 `0.30.0rc2` / `g8fde6d4e3`。要看真实状态用
+  重新生成，仍报镜像构建期那版。要看真实状态用
   `git -C $SRC_DIR/vllm-ascend log --oneline -1`。
 - `tests/` 的用例依赖的 `_mock_deps` 缺失，仓库内不可直接跑（§2.3）。

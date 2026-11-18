@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/models/deepseek_v41/engram/layer.py b/vllm_ascend/models/deepseek_v41/engram/layer.py
-index 1d8acdf4c..7712806ff 100644
+index 1d8acdf..7712806 100644
 --- a/vllm_ascend/models/deepseek_v41/engram/layer.py
 +++ b/vllm_ascend/models/deepseek_v41/engram/layer.py
 @@ -2,8 +2,15 @@
@@ -85,7 +85,7 @@ index 1d8acdf4c..7712806ff 100644
              rotation is None
              and hidden_states.device.type == "npu"
 diff --git a/vllm_ascend/models/deepseek_v41/indexer.py b/vllm_ascend/models/deepseek_v41/indexer.py
-index 3f272c134..99d1f5fe6 100644
+index 83c3ca3..ab92c25 100644
 --- a/vllm_ascend/models/deepseek_v41/indexer.py
 +++ b/vllm_ascend/models/deepseek_v41/indexer.py
 @@ -2,6 +2,8 @@
@@ -97,7 +97,7 @@ index 3f272c134..99d1f5fe6 100644
  import torch
  import torch_npu
  from torch import nn
-@@ -27,6 +29,18 @@ from vllm_ascend.worker.device_metadata import (
+@@ -33,6 +35,18 @@ from vllm_ascend.worker.device_metadata import (
      wait_for_device_metadata,
  )
  
@@ -116,7 +116,7 @@ index 3f272c134..99d1f5fe6 100644
  
  class DeepseekV41Indexer(nn.Module):
      """Small side attention that selects compressed KV positions.
-@@ -271,7 +285,15 @@ class DeepseekV41Indexer(nn.Module):
+@@ -281,7 +295,15 @@ class DeepseekV41Indexer(nn.Module):
          )
          op_metadata = source_metadata.qli_metadata
          wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(op_metadata))
@@ -134,7 +134,7 @@ index 3f272c134..99d1f5fe6 100644
              quantized_query,
              key,
 diff --git a/vllm_ascend/models/deepseek_v41/model.py b/vllm_ascend/models/deepseek_v41/model.py
-index 689ab3c59..10bfe954a 100644
+index 1fdb990..944f007 100644
 --- a/vllm_ascend/models/deepseek_v41/model.py
 +++ b/vllm_ascend/models/deepseek_v41/model.py
 @@ -11,6 +11,7 @@ from dataclasses import dataclass
@@ -145,7 +145,7 @@ index 689ab3c59..10bfe954a 100644
  import torch
  import torch.nn.functional as F
  import vllm.envs as envs
-@@ -95,6 +96,10 @@ from .engram.layer import AscendEngram
+@@ -98,6 +99,10 @@ from .engram.layer import AscendEngram
  from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
  from .indexer import DeepseekV41Indexer
  
@@ -156,7 +156,7 @@ index 689ab3c59..10bfe954a 100644
  
  def _engram_enabled_for_runtime(config, vllm_config) -> bool:
      """Use the current vLLM Engram opt-in for both runtime paths."""
-@@ -1749,9 +1754,21 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
+@@ -1782,9 +1787,21 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          if not self.model.has_engram:
              return self._load_model_weights((name, tensor) for name, tensor in weights if ".engram." not in name)
@@ -180,7 +180,7 @@ index 689ab3c59..10bfe954a 100644
          self.expert_weights = []
  
 diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
-index 22fc9633b..9238f8d6b 100644
+index d9a640b..73e4298 100644
 --- a/vllm_ascend/ops/fused_moe/token_dispatcher.py
 +++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py
 @@ -20,6 +20,7 @@
@@ -191,8 +191,8 @@ index 22fc9633b..9238f8d6b 100644
  from abc import ABC, abstractmethod
  from typing import Generic
  
-@@ -52,6 +53,85 @@ from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_se
- from vllm_ascend.quantization.quant_type import QuantType
+@@ -53,6 +54,85 @@ from vllm_ascend.quantization.quant_type import QuantType
+ from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg, get_dynamic_mx_quant_scale_alg
  from vllm_ascend.utils import should_skip_allreduce_across_dp_group
  
 +# [MOE-MASK-RANGE] begin ------------------------------------------------------
@@ -277,8 +277,8 @@ index 22fc9633b..9238f8d6b 100644
  EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
  EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
  
-@@ -391,10 +471,20 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
-             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+@@ -418,10 +498,20 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+ 
          if expert_map is not None:
              global_num_experts = len(expert_map) + global_redundant_expert_num
 -            mask = expert_map[topk_ids] != -1
@@ -301,7 +301,7 @@ index 22fc9633b..9238f8d6b 100644
              first_expert_idx = 0
              last_expert_idx = self.num_experts_local
 diff --git a/vllm_ascend/ops/rope_dsv4.py b/vllm_ascend/ops/rope_dsv4.py
-index fc213ad5d..00e525bb6 100644
+index fc213ad..00e525b 100644
 --- a/vllm_ascend/ops/rope_dsv4.py
 +++ b/vllm_ascend/ops/rope_dsv4.py
 @@ -9,6 +9,8 @@ import torch_npu
@@ -333,4 +333,3 @@ index fc213ad5d..00e525bb6 100644
                  # This is semantically equivalent to the previous
                  # `full_rope_cos[pos_tensor] / full_rope_sin[pos_tensor]`
                  # indexing followed by `copy_`; the change only combines the
-

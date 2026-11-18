@@ -352,10 +352,15 @@ fi
 # DRY_RUN 且树待重建时跳过（此时树还是旧的/空的，校验只会掩盖真正要打印的命令）
 if [ "${DRY_RUN_SKIP_TREE:-0}" != "1" ]; then
 for f in "$SRC_DIR/vllm-ascend/vllm_ascend/vllm_ascend_C.cpython-312-aarch64-linux-gnu.so" \
-         "$SRC_DIR/vllm-ascend/vllm_ascend/libvllm_ascend_kernels.so" \
-         "$SRC_DIR/vllm/vllm/_rust_tool_parser.abi3.so"; do
+         "$SRC_DIR/vllm-ascend/vllm_ascend/libvllm_ascend_kernels.so"; do
   [ -f "$f" ] || { echo "FATAL: 缺构建产物 $f（应从镜像里取出，见 README §3）" >&2; exit 1; }
 done
+# rust 侧产物：vllm-rs（可执行文件）在所有基座都有，是这里唯一可硬校验的那一件。
+# `_rust_tool_parser.abi3.so` 是 0.30 及更早的 Python 扩展，0.32 起上游已删除
+# （全树无任何 import 引用，vllm/tools/build_rust.py 里只剩一行注释）——
+# 把它写成必需项会让新基座在建树阶段就误报"缺构建产物"。
+[ -f "$SRC_DIR/vllm/vllm/vllm-rs" ] || {
+  echo "FATAL: 缺构建产物 $SRC_DIR/vllm/vllm/vllm-rs（应从镜像里取出，见 README §3）" >&2; exit 1; }
 # 12 个 gate 必须都在**将要挂载那棵树**的 envs.py 里有定义，否则 vLLM 只打一行
 # "Unknown vLLM environment variable"，服务照常起、收益全丢。这里前置拦。
 missing=""

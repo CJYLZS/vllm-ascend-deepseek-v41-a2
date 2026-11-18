@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
-index eb2f4b6b5..3811fd57d 100644
+index 39f61bc..f8562d7 100644
 --- a/vllm_ascend/attention/dsa_v1.py
 +++ b/vllm_ascend/attention/dsa_v1.py
 @@ -1,4 +1,5 @@
@@ -8,7 +8,7 @@ index eb2f4b6b5..3811fd57d 100644
  from collections.abc import Callable
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias
-@@ -61,6 +62,12 @@ from vllm_ascend.worker.device_metadata import (
+@@ -70,6 +71,12 @@ from vllm_ascend.worker.device_metadata import (
  )
  from vllm_ascend.worker.npu_input_batch import NPUInputBatch
  
@@ -21,8 +21,8 @@ index eb2f4b6b5..3811fd57d 100644
  if TYPE_CHECKING:
      from vllm.v1.core.sched.output import SchedulerOutput
  
-@@ -1756,6 +1763,31 @@ class AscendDSAImpl(AttentionImplBase[Any]):
-             batch_split_factor=1,
+@@ -2498,6 +2505,31 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             (exchange_num_tokens, self.wo_b.output_size), dtype, device
          )
  
 +    def _wo_a_2d(self, o_proj_input: torch.Tensor) -> torch.Tensor:
@@ -53,7 +53,7 @@ index eb2f4b6b5..3811fd57d 100644
      def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
          num_tokens = o_proj_input.shape[0]
          group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
-@@ -1832,7 +1864,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+@@ -2564,7 +2596,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
              dist.reduce_scatter_tensor(self._oproj_rs_out_buf, o_proj_output, group=oproj_group.device_group)
              output[...] = self._oproj_rs_out_buf[:num_tokens]
          else:
