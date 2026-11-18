@@ -382,10 +382,16 @@ V1 的完整内容保存在 `v1` 分支（`3d429b6`），补丁为单文件 1788
   实测没触发（3 个 8-rank 域下全局开也正常），但别的拓扑别照抄这个结论。
 - **AIV 会让 KV 容量少约 12k token**（3.64M → 3.63M，可用 KV 15.61 → 15.55 GiB）。
   只观测到一次，没做隔离变量；仍 3.46x 并发，不影响可用性。
-- **`v0320`（`v0.32.0rc1`）只做到「树建好 + 补丁干净应用 + 语法编译通过」**：
-  还没起过服。以下都没验证：图捕获数量（上游给模型类加了 `@support_torch_compile`）、
-  READY 时长、6 个 gate 的实际收益、PGO 在 3.12.16 上的增益、两套协议的每步时延。
-  起服后先按 README §11 的自证清单逐条确认，再谈数字。
+- **`v0320`（`v0.32.0rc1`）2026-11-18 已起服，自证逐条通过**：READY **685 s**、
+  目标图 **32/32**、draft **24/24**、V1-only 标记 **0**、8 条 V2 worker 标记、
+  6 个 gate 全传进容器、`aivMode[1]` **8/8 rank**、jemalloc 无 preload 告警、
+  PGO 自证行 1 条、KV 池 `rank 登记 8/8`、KV 容量 **3,489,673 tokens**（`max_len=524288`）、
+  冒烟三项全对。上游新增的 `@support_torch_compile` / `decoder_replay` **没有改变图捕获数量**。
+  **仍未验证**：6 个 gate 与 PGO 在这个基座上的**实际收益**、两套协议的**每步时延**
+  —— 要谈数字先按 README §11 测。
+- **`TRITON_ASCEND_ARCH` 在 0.32 的 triton 里已弃用**（每次起服 8 行
+  `FutureWarning: ... is deprecated ... host environment overrides are ignored`）。
+  `serve.sh` 仍在传它，但**已被忽略**（arch 由设备决定）。无害，但别再指望它生效。
 - 不要用 `vllm_ascend/_version.py` 判断实际跑的代码 —— 它由构建期生成，本补丁没
   重新生成，仍报镜像构建期那版。要看真实状态用
   `git -C $SRC_DIR/vllm-ascend log --oneline -1`。
